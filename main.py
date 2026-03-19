@@ -18,9 +18,7 @@ CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
-ENTRY_DELAY = 2  # minutes
 EXPIRY_MINUTES = 5
-
 MAX_PRICES = 5000
 TICK_CONFIRMATION = 3
 
@@ -52,16 +50,12 @@ def ema(data, period):
 def detect_trend(p):
     if len(p) < 50:
         return None
-
-    # Shorter EMAs for faster detection
-    e1 = ema(p[-10:],3)     # fast EMA
-    e2 = ema(p[-20:],5)     # medium EMA
-    e3 = ema(p[-30:],8)     # slow EMA
-    e4 = ema(p[-50:],13)    # longer EMA
-
+    e1 = ema(p[-10:],3)
+    e2 = ema(p[-20:],5)
+    e3 = ema(p[-30:],8)
+    e4 = ema(p[-50:],13)
     if not all([e1,e2,e3,e4]):
         return None
-
     if e1 > e2 and e3 > e4:
         return "BUY"
     elif e1 < e2 and e3 < e4:
@@ -74,27 +68,21 @@ def detect_trend(p):
 def big_move_ready(p, direction):
     if len(p) < 50:
         return False
-
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
-
     if std > 0.01 * mean:
         return False
-
     diff = np.diff(p[-10:])
-
     if direction == "BUY":
         if np.sum(diff > 0) < 8:
             return False
         if not (diff[-1] > diff[-2] > diff[-3]):
             return False
-
     if direction == "SELL":
         if np.sum(diff < 0) < 8:
             return False
         if not (diff[-1] < diff[-2] < diff[-3]):
             return False
-
     return True
 
 # ================================
@@ -103,14 +91,11 @@ def big_move_ready(p, direction):
 def entry_confirm(p, direction):
     if len(p) < 15:
         return False
-
     diff = np.diff(p[-10:])
-
     if direction == "BUY":
         return np.sum(diff > 0) >= 8
     if direction == "SELL":
         return np.sum(diff < 0) >= 8
-
     return False
 
 # ================================
@@ -121,9 +106,9 @@ def get_accuracy(p):
         return 82
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
-    if std/mean > 0.005:  # strong/active market
+    if std/mean > 0.005:
         return 85
-    return 82  # weak/stable market
+    return 82
 
 # ================================
 # LOCK
@@ -134,7 +119,7 @@ def locked():
 
 def set_lock():
     global global_lock
-    total = ENTRY_DELAY + EXPIRY_MINUTES
+    total = EXPIRY_MINUTES
     global_lock = datetime.now(TIMEZONE) + timedelta(minutes=total)
 
 # ================================
@@ -153,7 +138,6 @@ Preparing entry...
                   data={"chat_id":CHAT_ID,"text":msg})
 
 def send_final(pair, direction, acc):
-    entry = datetime.now(TIMEZONE) + timedelta(minutes=ENTRY_DELAY)
     arrow = "⬆️" if direction=="BUY" else "⬇️"
     msg = f"""
 SIGNAL {arrow}
@@ -162,7 +146,6 @@ Asset: {pair}_otc
 Payout: 92%
 Accuracy: {acc}%
 Expiration: M{EXPIRY_MINUTES}
-Entry Time: {entry.strftime('%I:%M %p')}
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id":CHAT_ID,"text":msg})
@@ -233,20 +216,12 @@ async def monitor():
                     if not big_move_ready(prices[pair], direction):
                         continue
 
-                    # SEND FIRST MESSAGE
+                    # ✅ IMMEDIATE SIGNAL (NO ENTRY DELAY)
                     send_asset(pair)
-                    pending_signal = {
-                        "pair": pair,
-                        "direction": direction,
-                        "time": datetime.now(TIMEZONE)
-                    }
 
-                    # WAIT FOR ENTRY TIME CONFIRMATION
-                    await asyncio.sleep(ENTRY_DELAY * 60)
-
-                    # FINAL CHECK (cancel if weak)
-                    acc = get_accuracy(prices[pair])
+                    # CHECK MASSIVE MOVE DURATION BEFORE FINAL SIGNAL
                     if entry_confirm(prices[pair], direction):
+                        acc = get_accuracy(prices[pair])
                         send_final(pair, direction, acc)
                         set_lock()
 
