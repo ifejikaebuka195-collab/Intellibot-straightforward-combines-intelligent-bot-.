@@ -1,7 +1,7 @@
 # ======================================
 # DERIV OTC SIGNAL BOT
 # STRICT POCKETOPTION-STYLE
-# OBSERVATION-FIRST + STABLE BIG MOVE
+# OBSERVATION-FIRST + STABLE BIG MOVE + LONG TREND DETECTION
 # ======================================  
 
 import asyncio
@@ -24,7 +24,7 @@ TIMEZONE = pytz.timezone("Africa/Lagos")
 EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
 TICK_CONFIRMATION = 3
-OBSERVATION_TICKS = 10  # How many ticks to observe before sending final signal
+OBSERVATION_TICKS = 10  # ticks to observe before sending final signal
 BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 
 # ----------------------
@@ -78,20 +78,30 @@ def big_move_ready(p, direction):
         return False
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
-    if std > 0.01 * mean:
-        return False  # Ignore erratic moves
+    if std > 0.01 * mean:  # Ignore erratic spikes
+        return False
     diff = np.diff(p[-10:])
     if direction == "BUY":
-        if np.sum(diff > 0) < 8:
-            return False
-        if not (diff[-1] > diff[-2] > diff[-3]):
+        if np.sum(diff > 0) < 8 or not (diff[-1] > diff[-2] > diff[-3]):
             return False
     if direction == "SELL":
-        if np.sum(diff < 0) < 8:
-            return False
-        if not (diff[-1] < diff[-2] < diff[-3]):
+        if np.sum(diff < 0) < 8 or not (diff[-1] < diff[-2] < diff[-3]):
             return False
     return True
+
+# ----------------------
+# LONG TREND DETECTION
+# ----------------------
+def long_stable_trend(p, direction):
+    """Detect long, consistent, non-manipulated trend likely to last 5-min expiry."""
+    if len(p) < 50:
+        return False
+    recent_diff = np.diff(p[-20:])
+    if direction == "BUY":
+        return np.all(recent_diff > 0)
+    if direction == "SELL":
+        return np.all(recent_diff < 0)
+    return False
 
 # ----------------------
 # STABLE MOVE CHECK
@@ -138,7 +148,7 @@ SIGNAL ⚠️
 Asset: {pair}_otc
 Expiration: M{EXPIRY_MINUTES}
 
-Observing market for stable big move...
+Observing market for stable move or long trend...
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id":CHAT_ID,"text":msg})
@@ -194,7 +204,7 @@ async def monitor():
                 for s in symbols:
                     prices[s] = []
                     tick_confirm[s] = {"count":0,"dir":None}
-                current_pair = symbols[0]  # pick first available pair
+                current_pair = symbols[0]
 
             async with websockets.connect(DERIV_WS) as ws:
                 await ws.send(json.dumps({"ticks":current_pair,"subscribe":1}))
@@ -225,22 +235,22 @@ async def monitor():
                         if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                             continue
 
-                        # Confirm big move
-                        if not big_move_ready(prices[pair], direction):
+                        # Only trigger if big move or long trend detected
+                        if not (big_move_ready(prices[pair], direction) or long_stable_trend(prices[pair], direction)):
                             continue
 
-                        # Drop asset for observation only if not already dropped
+                        # Drop asset for observation if not already dropped
                         if current_pair:
                             send_asset(current_pair)
                             current_pair = None  # lock to this pair until expiry
 
-                        # Send final signal if stable move confirmed
-                        if stable_move(prices[pair], direction):
+                        # Send final signal if stable move or long trend confirmed
+                        if stable_move(prices[pair], direction) or long_stable_trend(prices[pair], direction):
                             acc = get_accuracy(prices[pair])
                             send_final(pair, direction, acc)
                             set_lock()
-                            prices[pair] = []  # reset for next observation
-                            break  # stop monitoring until lock expires
+                            prices[pair] = []
+                            break  # wait until lock expires
 
                     except Exception as e_tick:
                         logging.error(f"Tick error: {e_tick}")
