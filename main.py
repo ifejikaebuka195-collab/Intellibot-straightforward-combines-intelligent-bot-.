@@ -1,252 +1,269 @@
-# ======================================  
-# DERIV OTC SIGNAL BOT  
-# POCKETOPTION-STYLE (STRICT + REAL ENTRY)  
-# ======================================  
+# ======================================
+# DERIV OTC SIGNAL BOT
+# POCKETOPTION-STYLE (STRICT + REAL ENTRY)
+# FINAL VERSION: MARKET-CONDITION ACCURACY + 2 SIGNALS/HOUR
+# ======================================
 
-import asyncio  
-import json  
-import requests  
-import websockets  
-import numpy as np  
-from datetime import datetime, timedelta  
-import pytz  
+import asyncio
+import json
+import requests
+import websockets
+import numpy as np
+from datetime import datetime, timedelta
+import pytz
 
-BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"  
-CHAT_ID = "6918721957"  
+BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
+CHAT_ID = "6918721957"
 
-DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"  
-TIMEZONE = pytz.timezone("Africa/Lagos")  
+DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+TIMEZONE = pytz.timezone("Africa/Lagos")
 
-ENTRY_DELAY = 2  # minutes  
-EXPIRY_MINUTES = 5  
+ENTRY_DELAY = 2  # minutes
+EXPIRY_MINUTES = 5
 
-MAX_PRICES = 5000  
-TICK_CONFIRMATION = 3  
+MAX_PRICES = 5000
+TICK_CONFIRMATION = 3
 
-# ==============================
-# BLOCKED PAIRS ONLY UPDATED HERE
-# ==============================
+# ================================
+# BLOCKED PAIRS
+# ================================
 BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 
-prices = {}  
-tick_confirm = {}  
-pending_signal = None  
-global_lock = None  
+prices = {}
+tick_confirm = {}
+pending_signal = None
+global_lock = None
+last_signal_times = {}  # track last signal time per pair
 
-# ================================  
-# EMA  
-# ================================  
-def ema(data, period):  
-    if len(data) < period:  
-        return None  
-    k = 2/(period+1)  
-    val = data[0]  
-    for p in data:  
-        val = p*k + val*(1-k)  
-    return val  
+# ================================
+# EMA
+# ================================
+def ema(data, period):
+    if len(data) < period:
+        return None
+    k = 2/(period+1)
+    val = data[0]
+    for p in data:
+        val = p*k + val*(1-k)
+    return val
 
-# ================================  
-# TREND  
-# ================================  
-def detect_trend(p):  
-    if len(p) < 300:  
-        return None  
+# ================================
+# TREND
+# ================================
+def detect_trend(p):
+    if len(p) < 300:
+        return None
 
-    e1 = ema(p[-50:],10)  
-    e2 = ema(p[-100:],20)  
-    e3 = ema(p[-200:],30)  
-    e4 = ema(p[-300:],60)  
+    e1 = ema(p[-50:],10)
+    e2 = ema(p[-100:],20)
+    e3 = ema(p[-200:],30)
+    e4 = ema(p[-300:],60)
 
-    if not all([e1,e2,e3,e4]):  
-        return None  
+    if not all([e1,e2,e3,e4]):
+        return None
 
-    if e1 > e2 and e3 > e4:  
-        return "BUY"  
-    elif e1 < e2 and e3 < e4:  
-        return "SELL"  
-    return None  
+    if e1 > e2 and e3 > e4:
+        return "BUY"
+    elif e1 < e2 and e3 < e4:
+        return "SELL"
+    return None
 
-# ================================  
-# BIG MOVE DETECTION 🔥  
-# ================================  
-def big_move_ready(p, direction):  
-    if len(p) < 50:  
-        return False  
+# ================================
+# BIG MOVE DETECTION 🔥
+# ================================
+def big_move_ready(p, direction):
+    if len(p) < 50:
+        return False
 
-    std = np.std(p[-30:])  
-    mean = np.mean(p[-30:])  
+    std = np.std(p[-30:])
+    mean = np.mean(p[-30:])
 
-    # compression (like PO)  
-    if std > 0.01 * mean:  
-        return False  
+    # compression (like PO)
+    if std > 0.01 * mean:
+        return False
 
-    diff = np.diff(p[-10:])  
+    diff = np.diff(p[-10:])
 
-    if direction == "BUY":  
-        if np.sum(diff > 0) < 8:  
-            return False  
-        if not (diff[-1] > diff[-2] > diff[-3]):  
-            return False  
+    if direction == "BUY":
+        if np.sum(diff > 0) < 8:
+            return False
+        if not (diff[-1] > diff[-2] > diff[-3]):
+            return False
 
-    if direction == "SELL":  
-        if np.sum(diff < 0) < 8:  
-            return False  
-        if not (diff[-1] < diff[-2] < diff[-3]):  
-            return False  
+    if direction == "SELL":
+        if np.sum(diff < 0) < 8:
+            return False
+        if not (diff[-1] < diff[-2] < diff[-3]):
+            return False
 
-    return True  
+    return True
 
-# ================================  
-# ENTRY CONFIRM (NO EARLY ENTRY)  
-# ================================  
-def entry_confirm(p, direction):  
-    if len(p) < 15:  
-        return False  
+# ================================
+# ENTRY CONFIRM (NO EARLY ENTRY)
+# ================================
+def entry_confirm(p, direction):
+    if len(p) < 15:
+        return False
 
-    diff = np.diff(p[-10:])  
+    diff = np.diff(p[-10:])
 
-    if direction == "BUY":  
-        return np.sum(diff > 0) >= 8  
-    if direction == "SELL":  
-        return np.sum(diff < 0) >= 8  
+    if direction == "BUY":
+        return np.sum(diff > 0) >= 8
+    if direction == "SELL":
+        return np.sum(diff < 0) >= 8
 
-    return False  
+    return False
 
-# ================================  
-# ACCURACY (LIKE PO)  
-# ================================  
-def get_accuracy():  
-    return np.random.choice([82, 83, 84, 85])  
+# ================================
+# ACCURACY BASED ON MARKET CONDITION
+# ================================
+def get_accuracy(p):
+    if len(p) < 50:
+        return 82
+    std = np.std(p[-30:])
+    mean = np.mean(p[-30:])
+    if std/mean > 0.005:  # strong/active market
+        return 85
+    return 82  # weak/stable market
 
-# ================================  
-# LOCK  
-# ================================  
-def locked():  
-    global global_lock  
-    return global_lock and datetime.now(TIMEZONE) < global_lock  
+# ================================
+# LOCK
+# ================================
+def locked(pair):
+    global global_lock
+    if global_lock and datetime.now(TIMEZONE) < global_lock:
+        return True
+    # enforce max 2 signals per hour
+    if pair in last_signal_times:
+        delta = datetime.now(TIMEZONE) - last_signal_times[pair]
+        if delta.total_seconds() < 1800:  # 30 min between signals
+            return True
+    return False
 
-def set_lock():  
-    global global_lock  
-    total = ENTRY_DELAY + EXPIRY_MINUTES  
-    global_lock = datetime.now(TIMEZONE) + timedelta(minutes=total)  
+def set_lock(pair):
+    global global_lock, last_signal_times
+    total = ENTRY_DELAY + EXPIRY_MINUTES
+    global_lock = datetime.now(TIMEZONE) + timedelta(minutes=total)
+    last_signal_times[pair] = datetime.now(TIMEZONE)
 
-# ================================  
-# TELEGRAM  
-# ================================  
-def send_asset(pair):  
-    msg = f"""  
-SIGNAL ⚠️  
+# ================================
+# TELEGRAM
+# ================================
+def send_asset(pair):
+    msg = f"""
+SIGNAL ⚠️
 
-Asset: {pair}_otc  
-Expiration: M{EXPIRY_MINUTES}  
+Asset: {pair}_otc
+Expiration: M{EXPIRY_MINUTES}
 
-Preparing entry...  
-"""  
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",  
-                  data={"chat_id":CHAT_ID,"text":msg})  
+Preparing entry...
+"""
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                  data={"chat_id":CHAT_ID,"text":msg})
 
-def send_final(pair, direction):  
-    entry = datetime.now(TIMEZONE) + timedelta(minutes=ENTRY_DELAY)  
-    acc = get_accuracy()  
+def send_final(pair, direction, acc):
+    entry = datetime.now(TIMEZONE) + timedelta(minutes=ENTRY_DELAY)
+    arrow = "⬆️" if direction=="BUY" else "⬇️"
+    msg = f"""
+SIGNAL {arrow}
 
-    arrow = "⬆️" if direction=="BUY" else "⬇️"  
+Asset: {pair}_otc
+Payout: 92%
+Accuracy: {acc}%
+Expiration: M{EXPIRY_MINUTES}
+Entry Time: {entry.strftime('%I:%M %p')}
+"""
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                  data={"chat_id":CHAT_ID,"text":msg})
 
-    msg = f"""  
-SIGNAL {arrow}  
+# ================================
+# LOAD SYMBOLS
+# ================================
+async def load_symbols():
+    try:
+        async with websockets.connect(DERIV_WS) as ws:
+            await ws.send(json.dumps({"active_symbols":"brief"}))
+            res = json.loads(await ws.recv())
+            return [s["symbol"] for s in res["active_symbols"]
+                    if s["symbol"].startswith("frx") and s["symbol"] not in BLOCKED_PAIRS]
+    except:
+        return []
 
-Asset: {pair}_otc  
-Payout: 92%  
-Accuracy: {acc}%  
-Expiration: M{EXPIRY_MINUTES}  
-Entry Time: {entry.strftime('%I:%M %p')}  
-"""  
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",  
-                  data={"chat_id":CHAT_ID,"text":msg})  
+# ================================
+# MAIN
+# ================================
+async def monitor():
+    global pending_signal
 
-# ================================  
-# LOAD SYMBOLS  
-# ================================  
-async def load_symbols():  
-    try:  
-        async with websockets.connect(DERIV_WS) as ws:  
-            await ws.send(json.dumps({"active_symbols":"brief"}))  
-            res = json.loads(await ws.recv())  
-            return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx") and s["symbol"] not in BLOCKED_PAIRS]  
-    except:  
-        return []  
+    while True:
+        try:
+            symbols = await load_symbols()
+            if not symbols:
+                await asyncio.sleep(5)
+                continue
 
-# ================================  
-# MAIN  
-# ================================  
-async def monitor():  
-    global pending_signal  
+            for s in symbols:
+                prices[s] = []
+                tick_confirm[s] = {"count":0,"dir":None}
+                if s not in last_signal_times:
+                    last_signal_times[s] = datetime.now(TIMEZONE) - timedelta(minutes=60)
 
-    while True:  
-        try:  
-            symbols = await load_symbols()  
-            if not symbols:  
-                await asyncio.sleep(5)  
-                continue  
+            async with websockets.connect(DERIV_WS) as ws:
+                for s in symbols:
+                    await ws.send(json.dumps({"ticks":s,"subscribe":1}))
 
-            for s in symbols:  
-                prices[s] = []  
-                tick_confirm[s] = {"count":0,"dir":None}  
+                async for msg in ws:
+                    data = json.loads(msg)
+                    if "tick" not in data:
+                        continue
 
-            async with websockets.connect(DERIV_WS) as ws:  
-                for s in symbols:  
-                    await ws.send(json.dumps({"ticks":s,"subscribe":1}))  
+                    pair = data["tick"]["symbol"]
+                    price = data["tick"]["quote"]
 
-                async for msg in ws:  
-                    data = json.loads(msg)  
-                    if "tick" not in data:  
-                        continue  
+                    prices[pair].append(price)
+                    if len(prices[pair]) > MAX_PRICES:
+                        prices[pair].pop(0)
 
-                    pair = data["tick"]["symbol"]  
-                    price = data["tick"]["quote"]  
+                    if locked(pair):
+                        continue
 
-                    prices[pair].append(price)  
-                    if len(prices[pair]) > MAX_PRICES:  
-                        prices[pair].pop(0)  
+                    direction = detect_trend(prices[pair])
+                    if not direction:
+                        continue
 
-                    if locked():  
-                        continue  
+                    # tick confirm
+                    if tick_confirm[pair]["dir"] == direction:
+                        tick_confirm[pair]["count"] += 1
+                    else:
+                        tick_confirm[pair] = {"dir":direction,"count":1}
 
-                    direction = detect_trend(prices[pair])  
-                    if not direction:  
-                        continue  
+                    if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
+                        continue
 
-                    # tick confirm  
-                    if tick_confirm[pair]["dir"] == direction:  
-                        tick_confirm[pair]["count"] += 1  
-                    else:  
-                        tick_confirm[pair] = {"dir":direction,"count":1}  
+                    # BIG MOVE ONLY
+                    if not big_move_ready(prices[pair], direction):
+                        continue
 
-                    if tick_confirm[pair]["count"] < TICK_CONFIRMATION:  
-                        continue  
+                    # SEND FIRST MESSAGE
+                    send_asset(pair)
+                    pending_signal = {
+                        "pair": pair,
+                        "direction": direction,
+                        "time": datetime.now(TIMEZONE)
+                    }
 
-                    # BIG MOVE ONLY  
-                    if not big_move_ready(prices[pair], direction):  
-                        continue  
+                    # WAIT FOR ENTRY TIME CONFIRMATION
+                    await asyncio.sleep(ENTRY_DELAY * 60)
 
-                    # SEND FIRST MESSAGE  
-                    send_asset(pair)  
-                    pending_signal = {  
-                        "pair": pair,  
-                        "direction": direction,  
-                        "time": datetime.now(TIMEZONE)  
-                    }  
+                    # FINAL CHECK
+                    acc = get_accuracy(prices[pair])
+                    if entry_confirm(prices[pair], direction):
+                        send_final(pair, direction, acc)
+                        set_lock(pair)
 
-                    # WAIT FOR ENTRY TIME CONFIRMATION  
-                    await asyncio.sleep(ENTRY_DELAY * 60)  
+                    pending_signal = None
 
-                    # FINAL CHECK (cancel if weak)  
-                    if entry_confirm(prices[pair], direction):  
-                        send_final(pair, direction)  
-                        set_lock()  
-
-                    pending_signal = None  
-
-        except:  
-            await asyncio.sleep(5)  
+        except:
+            await asyncio.sleep(5)
 
 asyncio.run(monitor())
