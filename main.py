@@ -18,7 +18,7 @@ CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
-ENTRY_DELAY = 2  # minutes (kept but NOT used)
+ENTRY_DELAY = 2  # minutes
 EXPIRY_MINUTES = 5
 
 MAX_PRICES = 5000
@@ -53,10 +53,11 @@ def detect_trend(p):
     if len(p) < 50:
         return None
 
-    e1 = ema(p[-10:],3)
-    e2 = ema(p[-20:],5)
-    e3 = ema(p[-30:],8)
-    e4 = ema(p[-50:],13)
+    # Shorter EMAs for faster detection
+    e1 = ema(p[-10:],3)     # fast EMA
+    e2 = ema(p[-20:],5)     # medium EMA
+    e3 = ema(p[-30:],8)     # slow EMA
+    e4 = ema(p[-50:],13)    # longer EMA
 
     if not all([e1,e2,e3,e4]):
         return None
@@ -120,9 +121,9 @@ def get_accuracy(p):
         return 82
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
-    if std/mean > 0.005:
+    if std/mean > 0.005:  # strong/active market
         return 85
-    return 82
+    return 82  # weak/stable market
 
 # ================================
 # LOCK
@@ -133,7 +134,7 @@ def locked():
 
 def set_lock():
     global global_lock
-    total = EXPIRY_MINUTES
+    total = ENTRY_DELAY + EXPIRY_MINUTES
     global_lock = datetime.now(TIMEZONE) + timedelta(minutes=total)
 
 # ================================
@@ -152,6 +153,7 @@ Preparing entry...
                   data={"chat_id":CHAT_ID,"text":msg})
 
 def send_final(pair, direction, acc):
+    entry = datetime.now(TIMEZONE) + timedelta(minutes=ENTRY_DELAY)
     arrow = "⬆️" if direction=="BUY" else "⬇️"
     msg = f"""
 SIGNAL {arrow}
@@ -160,6 +162,7 @@ Asset: {pair}_otc
 Payout: 92%
 Accuracy: {acc}%
 Expiration: M{EXPIRY_MINUTES}
+Entry Time: {entry.strftime('%I:%M %p')}
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id":CHAT_ID,"text":msg})
@@ -217,6 +220,7 @@ async def monitor():
                     if not direction:
                         continue
 
+                    # tick confirm
                     if tick_confirm[pair]["dir"] == direction:
                         tick_confirm[pair]["count"] += 1
                     else:
@@ -225,17 +229,28 @@ async def monitor():
                     if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                         continue
 
+                    # BIG MOVE ONLY
                     if not big_move_ready(prices[pair], direction):
                         continue
 
                     # SEND FIRST MESSAGE
                     send_asset(pair)
+                    pending_signal = {
+                        "pair": pair,
+                        "direction": direction,
+                        "time": datetime.now(TIMEZONE)
+                    }
 
-                    # FINAL CONFIRM (NO WAITING)
+                    # WAIT FOR ENTRY TIME CONFIRMATION
+                    await asyncio.sleep(ENTRY_DELAY * 60)
+
+                    # FINAL CHECK (cancel if weak)
+                    acc = get_accuracy(prices[pair])
                     if entry_confirm(prices[pair], direction):
-                        acc = get_accuracy(prices[pair])
                         send_final(pair, direction, acc)
                         set_lock()
+
+                    pending_signal = None
 
         except:
             await asyncio.sleep(5)
