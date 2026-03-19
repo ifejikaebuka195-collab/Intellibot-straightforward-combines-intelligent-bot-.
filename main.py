@@ -1,7 +1,7 @@
 # ======================================
 # DERIV OTC SIGNAL BOT
-# STRICT POCKETOPTION-STYLE
-# OBSERVATION-FIRST + BIG MOVE + PULLBACK
+# POCKETOPTION-STYLE
+# OBSERVATION-FIRST + STABLE TREND
 # ======================================
 
 import asyncio
@@ -25,7 +25,6 @@ EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
 TICK_CONFIRMATION = 3
 OBSERVATION_TICKS = 10
-MIN_DIFF_TICKS = 8
 BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 
 # ----------------------
@@ -33,7 +32,7 @@ BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 # ----------------------
 prices = {}
 tick_confirm = {}
-active_signals = {}  # track pairs currently in cooldown
+active_pair = None
 global_lock = None
 
 # ----------------------
@@ -42,7 +41,7 @@ global_lock = None
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 # ----------------------
-# EMA
+# EMA FUNCTION
 # ----------------------
 def ema(data, period):
     if len(data) < period:
@@ -80,46 +79,51 @@ def big_move_ready(p, direction):
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
     if std > 0.01 * mean:
-        return False
+        return False  # Ignore spikes
     diff = np.diff(p[-10:])
     if direction == "BUY":
-        if np.sum(diff > 0) < MIN_DIFF_TICKS:
+        if np.sum(diff > 0) < 8:
             return False
         if not (diff[-1] > diff[-2] > diff[-3]):
             return False
     if direction == "SELL":
-        if np.sum(diff < 0) < MIN_DIFF_TICKS:
+        if np.sum(diff < 0) < 8:
             return False
         if not (diff[-1] < diff[-2] < diff[-3]):
             return False
     return True
 
 # ----------------------
-# PULLBACK / STABLE MOVE
+# STABLE TREND CHECK
 # ----------------------
-def stable_move(p, direction):
+def stable_trend(p, direction):
     if len(p) < OBSERVATION_TICKS + 5:
         return False
     last_diff = np.diff(p[-OBSERVATION_TICKS:])
     if direction == "BUY":
-        # Pullback check: last few ticks should still trend up
         return np.all(last_diff > 0)
     if direction == "SELL":
         return np.all(last_diff < 0)
     return False
 
 # ----------------------
-# ACCURACY
+# ACCURACY DERIVED
 # ----------------------
 def get_accuracy(p):
     if len(p) < 50:
         return 82
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
-    return 85 if std/mean > 0.005 else 82
+    ratio = std / mean
+    if ratio < 0.003:
+        return 90
+    elif ratio < 0.006:
+        return 85
+    else:
+        return 82
 
 # ----------------------
-# LOCK
+# LOCKS
 # ----------------------
 def locked():
     global global_lock
@@ -139,11 +143,11 @@ SIGNAL ⚠️
 Asset: {pair}_otc
 Expiration: M{EXPIRY_MINUTES}
 
-Observing market for stable big move...
+Observing market for stable trend...
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id":CHAT_ID,"text":msg})
-    logging.info(f"Asset observation started: {pair}")
+    logging.info(f"Asset dropped for observation: {pair}")
 
 def send_final(pair, direction, acc):
     arrow = "⬆️" if direction=="BUY" else "⬇️"
@@ -158,8 +162,6 @@ Expiration: M{EXPIRY_MINUTES}
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id":CHAT_ID,"text":msg})
     logging.info(f"Final signal sent: {pair} {direction} Accuracy: {acc}%")
-    # Start cooldown
-    active_signals[pair] = datetime.now(TIMEZONE) + timedelta(minutes=EXPIRY_MINUTES)
 
 # ----------------------
 # LOAD SYMBOLS
@@ -179,20 +181,28 @@ async def load_symbols():
 # MAIN LOOP
 # ----------------------
 async def monitor():
+    global active_pair
+
     while True:
         try:
+            if locked():
+                await asyncio.sleep(1)
+                continue
+
             symbols = await load_symbols()
             if not symbols:
                 await asyncio.sleep(5)
                 continue
 
-            async with websockets.connect(DERIV_WS) as ws:
-                # Subscribe to all available symbols
+            # Only one active observation at a time
+            if active_pair is None:
                 for s in symbols:
-                    if s not in prices:
-                        prices[s] = []
-                        tick_confirm[s] = {"count":0,"dir":None}
-                    await ws.send(json.dumps({"ticks":s,"subscribe":1}))
+                    prices[s] = []
+                    tick_confirm[s] = {"count":0,"dir":None}
+                active_pair = symbols[0]
+
+            async with websockets.connect(DERIV_WS) as ws:
+                await ws.send(json.dumps({"ticks":active_pair,"subscribe":1}))
 
                 async for msg in ws:
                     try:
@@ -203,19 +213,10 @@ async def monitor():
                         pair = data["tick"]["symbol"]
                         price = data["tick"]["quote"]
 
-                        # Skip pairs currently in cooldown
-                        if pair in active_signals:
-                            if datetime.now(TIMEZONE) < active_signals[pair]:
-                                continue
-                            else:
-                                del active_signals[pair]
-                                prices[pair] = []
-
                         prices[pair].append(price)
                         if len(prices[pair]) > MAX_PRICES:
                             prices[pair].pop(0)
 
-                        # Detect trend
                         direction = detect_trend(prices[pair])
                         if not direction:
                             continue
@@ -229,17 +230,22 @@ async def monitor():
                         if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                             continue
 
-                        # Confirm big move
-                        if not big_move_ready(prices[pair], direction):
+                        # Confirm big move or stable trend
+                        if not big_move_ready(prices[pair], direction) and not stable_trend(prices[pair], direction):
                             continue
 
-                        # Observation phase
-                        send_asset(pair)
+                        # Drop asset for observation
+                        if active_pair:
+                            send_asset(active_pair)
+                            active_pair = None  # lock to this pair
 
-                        # Send final signal if stable and pullback confirmed
-                        if stable_move(prices[pair], direction):
+                        # Send final signal if trend confirmed
+                        if stable_trend(prices[pair], direction):
                             acc = get_accuracy(prices[pair])
                             send_final(pair, direction, acc)
+                            set_lock()
+                            prices[pair] = []
+                            break  # wait until expiry before next signal
 
                     except Exception as e_tick:
                         logging.error(f"Tick error: {e_tick}")
