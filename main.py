@@ -1,6 +1,7 @@
 # ======================================
 # DERIV OTC SIGNAL BOT
-# POCKETOPTION-STYLE (STRICT + REAL ENTRY + OBSERVATION)
+# STRICT POCKETOPTION-STYLE
+# OBSERVATION-FIRST + STABLE BIG MOVE
 # ======================================  
 
 import asyncio
@@ -23,6 +24,7 @@ TIMEZONE = pytz.timezone("Africa/Lagos")
 EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
 TICK_CONFIRMATION = 3
+OBSERVATION_TICKS = 10  # How many ticks to observe before sending final signal
 BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 
 # ----------------------
@@ -30,7 +32,7 @@ BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 # ----------------------
 prices = {}
 tick_confirm = {}
-pending_signal = None
+current_pair = None
 global_lock = None
 
 # ----------------------
@@ -77,7 +79,7 @@ def big_move_ready(p, direction):
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
     if std > 0.01 * mean:
-        return False
+        return False  # Ignore erratic moves
     diff = np.diff(p[-10:])
     if direction == "BUY":
         if np.sum(diff > 0) < 8:
@@ -92,17 +94,17 @@ def big_move_ready(p, direction):
     return True
 
 # ----------------------
-# STRONG MOVE CHECK
+# STABLE MOVE CHECK
 # ----------------------
-def strong_stable_move(p, direction):
-    """Check for a stable, reliable move that will last the 5-min expiry."""
-    if len(p) < 20:
+def stable_move(p, direction):
+    """Check if the move is strong and likely to last until expiry."""
+    if len(p) < OBSERVATION_TICKS + 5:
         return False
-    last_diff = np.diff(p[-15:])
+    last_diff = np.diff(p[-OBSERVATION_TICKS:])
     if direction == "BUY":
-        return np.all(last_diff[-5:] > 0)
+        return np.all(last_diff > 0)
     if direction == "SELL":
-        return np.all(last_diff[-5:] < 0)
+        return np.all(last_diff < 0)
     return False
 
 # ----------------------
@@ -136,11 +138,11 @@ SIGNAL ⚠️
 Asset: {pair}_otc
 Expiration: M{EXPIRY_MINUTES}
 
-Observing market for optimal entry...
+Observing market for stable big move...
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id":CHAT_ID,"text":msg})
-    logging.info(f"Asset dropped for observation: {pair}")
+    logging.info(f"Asset observation started: {pair}")
 
 def send_final(pair, direction, acc):
     arrow = "⬆️" if direction=="BUY" else "⬇️"
@@ -174,22 +176,28 @@ async def load_symbols():
 # MAIN LOOP
 # ----------------------
 async def monitor():
-    global pending_signal
+    global current_pair
 
     while True:
         try:
+            if locked():
+                await asyncio.sleep(1)
+                continue
+
             symbols = await load_symbols()
             if not symbols:
                 await asyncio.sleep(5)
                 continue
 
-            for s in symbols:
-                prices[s] = []
-                tick_confirm[s] = {"count":0,"dir":None}
+            # Only monitor one currency pair at a time
+            if current_pair is None:
+                for s in symbols:
+                    prices[s] = []
+                    tick_confirm[s] = {"count":0,"dir":None}
+                current_pair = symbols[0]  # pick first available pair
 
             async with websockets.connect(DERIV_WS) as ws:
-                for s in symbols:
-                    await ws.send(json.dumps({"ticks":s,"subscribe":1}))
+                await ws.send(json.dumps({"ticks":current_pair,"subscribe":1}))
 
                 async for msg in ws:
                     try:
@@ -204,14 +212,11 @@ async def monitor():
                         if len(prices[pair]) > MAX_PRICES:
                             prices[pair].pop(0)
 
-                        if locked():
-                            continue
-
                         direction = detect_trend(prices[pair])
                         if not direction:
                             continue
 
-                        # Confirm direction over multiple ticks
+                        # Tick confirmation
                         if tick_confirm[pair]["dir"] == direction:
                             tick_confirm[pair]["count"] += 1
                         else:
@@ -220,24 +225,25 @@ async def monitor():
                         if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                             continue
 
-                        # Check if big move is about to happen
+                        # Confirm big move
                         if not big_move_ready(prices[pair], direction):
                             continue
 
-                        # ✅ Drop asset and wait for stable move
-                        if pending_signal != pair:
-                            send_asset(pair)
-                            pending_signal = pair
+                        # Drop asset for observation only if not already dropped
+                        if current_pair:
+                            send_asset(current_pair)
+                            current_pair = None  # lock to this pair until expiry
 
-                        # ✅ Only send final signal when strong, stable move is confirmed
-                        if strong_stable_move(prices[pair], direction):
+                        # Send final signal if stable move confirmed
+                        if stable_move(prices[pair], direction):
                             acc = get_accuracy(prices[pair])
                             send_final(pair, direction, acc)
                             set_lock()
-                            pending_signal = None
+                            prices[pair] = []  # reset for next observation
+                            break  # stop monitoring until lock expires
 
-                    except Exception as e_inner:
-                        logging.error(f"Tick processing error: {e_inner}")
+                    except Exception as e_tick:
+                        logging.error(f"Tick error: {e_tick}")
 
         except Exception as e_outer:
             logging.error(f"Main loop error: {e_outer}")
