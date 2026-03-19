@@ -2,6 +2,7 @@
 # DERIV OTC SIGNAL BOT
 # FULLY ENHANCED: POCKETOPTION-STYLE SIGNALS
 # HISTORICAL PATTERN + SMART ENTRY + ACCURACY MATCH
+# GLOBAL LOCK ENABLED
 # ======================================
 
 import asyncio
@@ -26,10 +27,9 @@ MG_STEP = 2
 MAX_MG_STEPS = 3
 EXPIRY_MINUTES = 2
 
-MAX_PRICES = 5000  # stores historical ticks for pattern analysis
+MAX_PRICES = 5000
 RETRY_SECONDS = 5
 TICK_CONFIRMATION = 3
-GLOBAL_SIGNAL_COOLDOWN = 10  # seconds between global signals
 
 BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 
@@ -38,6 +38,7 @@ tick_confirm = {}
 pending_signal = {}
 active_signal = {}
 last_global_signal_time = None
+global_lock_active = None  # <-- Global lock for all pairs
 
 # ================================
 # EMA CALCULATION
@@ -52,7 +53,7 @@ def ema(data, period):
     return value
 
 # ================================
-# TREND STRENGTH (fixed)
+# TREND STRENGTH
 # ================================
 def trend_strength(price_list):
     if len(price_list) < 150:
@@ -65,7 +66,6 @@ def trend_strength(price_list):
 def pattern_accuracy(price_list, direction):
     if len(price_list) < 200:
         return 82
-    last_diff = np.diff(price_list[-10:])
     matches = 0
     total_patterns = 0
     for i in range(len(price_list)-210):
@@ -77,9 +77,8 @@ def pattern_accuracy(price_list, direction):
         total_patterns +=1
     if total_patterns == 0:
         return 82
-    # scale accuracy proportionally to match percentage
     match_ratio = matches / total_patterns
-    return min(82 + int(match_ratio*3), 85)  # max 85%
+    return min(82 + int(match_ratio*3), 85)
 
 # ================================
 # TREND DETECTION
@@ -118,15 +117,21 @@ def predictive_valid(price_list, direction):
 # ================================
 # SIGNAL LOCK
 # ================================
-def signal_active(pair):
-    if pair not in active_signal or active_signal[pair] is None:
-        return False
-    return datetime.now(TIMEZONE) < active_signal[pair]
+def signal_active(pair=None):
+    global global_lock_active
+    now = datetime.now(TIMEZONE)
+    if global_lock_active and now < global_lock_active:
+        return True
+    if pair and pair in active_signal and active_signal[pair] and now < active_signal[pair]:
+        return True
+    return False
 
 def register_signal(pair):
+    global global_lock_active
     now = datetime.now(TIMEZONE)
     total_lock = ENTRY_DELAY + MG_STEP*MAX_MG_STEPS + EXPIRY_MINUTES
     active_signal[pair] = now + timedelta(minutes=total_lock)
+    global_lock_active = now + timedelta(minutes=total_lock)  # <-- Global lock applied
 
 # ================================
 # FLAG EMOJIS
@@ -140,13 +145,9 @@ def get_flag(code):
 # SEND TELEGRAM SIGNAL
 # ================================
 def send_signal(pair,direction,accuracy,strength):
-    global last_global_signal_time
     now_time = datetime.now(TIMEZONE)
-    if last_global_signal_time and (now_time - last_global_signal_time).total_seconds() < GLOBAL_SIGNAL_COOLDOWN:
+    if signal_active():  # <-- check global lock
         return
-    if signal_active(pair):
-        return
-    last_global_signal_time = now_time
     now = now_time
     entry_time = now + timedelta(minutes=ENTRY_DELAY)
     expiry_time = entry_time + timedelta(minutes=EXPIRY_MINUTES)
@@ -217,7 +218,7 @@ async def monitor():
                         if tick_confirm[pair]["count"] >= TICK_CONFIRMATION:
                             if predictive_valid(prices[pair],direction):
                                 pending_signal[pair] = (direction,accuracy,strength)
-                    if pending_signal.get(pair) and not signal_active(pair):
+                    if pending_signal.get(pair) and not signal_active():
                         dir_check,acc_check,str_check = pending_signal[pair]
                         acc2,str2,dir2 = detect_trend(prices[pair])
                         if dir2 == dir_check and predictive_valid(prices[pair],dir_check):
