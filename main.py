@@ -1,7 +1,7 @@
 # ======================================
 # DERIV OTC SIGNAL BOT
 # POCKETOPTION-STYLE (STRICT + REAL ENTRY)
-# FINAL VERSION: MARKET-CONDITION ACCURACY + FAST TREND DETECTION
+# FINAL VERSION: MARKET-CONDITION ACCURACY + FAST TREND DETECTION + STRONG MOVE SAFEGUARD
 # ======================================  
 
 import asyncio
@@ -96,6 +96,20 @@ def entry_confirm(p, direction):
         return np.sum(diff > 0) >= 8
     if direction == "SELL":
         return np.sum(diff < 0) >= 8
+    return False
+
+# ================================
+# STRONG MOVE SAFEGUARD
+# ================================
+def strong_move(p, direction):
+    # Only allow signals if recent price movement is extremely consistent
+    if len(p) < 20:
+        return False
+    last_diff = np.diff(p[-15:])
+    if direction == "BUY":
+        return np.all(last_diff[-5:] > 0)
+    if direction == "SELL":
+        return np.all(last_diff[-5:] < 0)
     return False
 
 # ================================
@@ -203,7 +217,6 @@ async def monitor():
                     if not direction:
                         continue
 
-                    # tick confirm
                     if tick_confirm[pair]["dir"] == direction:
                         tick_confirm[pair]["count"] += 1
                     else:
@@ -212,15 +225,14 @@ async def monitor():
                     if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                         continue
 
-                    # BIG MOVE ONLY
                     if not big_move_ready(prices[pair], direction):
                         continue
 
-                    # ✅ IMMEDIATE SIGNAL (NO ENTRY DELAY)
+                    # ✅ ASSET FIRST
                     send_asset(pair)
 
-                    # CHECK MASSIVE MOVE DURATION BEFORE FINAL SIGNAL
-                    if entry_confirm(prices[pair], direction):
+                    # ✅ FINAL SIGNAL ONLY IF STRONG MOVE
+                    if entry_confirm(prices[pair], direction) and strong_move(prices[pair], direction):
                         acc = get_accuracy(prices[pair])
                         send_final(pair, direction, acc)
                         set_lock()
