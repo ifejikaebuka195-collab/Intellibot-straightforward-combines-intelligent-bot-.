@@ -1,8 +1,7 @@
 # ======================================
 # DERIV OTC SIGNAL BOT
-# POCKETOPTION-STYLE (STRICT + REAL ENTRY)
-# FINAL VERSION: FAST TREND + MASSIVE MOVE CONFIRMATION
-# ======================================
+# POCKETOPTION-STYLE (ALIGNED FLOW)
+# ======================================  
 
 import asyncio
 import json
@@ -19,18 +18,14 @@ DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
 EXPIRY_MINUTES = 5
-
 MAX_PRICES = 5000
 TICK_CONFIRMATION = 3
 
-# ================================
-# BLOCKED PAIRS
-# ================================
 BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 
 prices = {}
 tick_confirm = {}
-pending_signal = None
+asset_sent = None
 global_lock = None
 
 # ================================
@@ -46,17 +41,20 @@ def ema(data, period):
     return val
 
 # ================================
-# TREND (FAST DETECTION)
+# FAST TREND
 # ================================
 def detect_trend(p):
     if len(p) < 50:
         return None
+
     e1 = ema(p[-10:],3)
     e2 = ema(p[-20:],5)
     e3 = ema(p[-30:],8)
     e4 = ema(p[-50:],13)
+
     if not all([e1,e2,e3,e4]):
         return None
+
     if e1 > e2 and e3 > e4:
         return "BUY"
     elif e1 < e2 and e3 < e4:
@@ -64,43 +62,30 @@ def detect_trend(p):
     return None
 
 # ================================
-# BIG MOVE DETECTION 🔥
+# EXPLOSION DETECTION (IMPROVED)
 # ================================
-def big_move_ready(p, direction):
-    if len(p) < 50:
+def explosion_ready(p, direction):
+    if len(p) < 60:
         return False
-    std = np.std(p[-30:])
-    mean = np.mean(p[-30:])
-    if std > 0.01 * mean:
-        return False
-    diff = np.diff(p[-10:])
-    if direction == "BUY":
-        if np.sum(diff > 0) < 8:
-            return False
-        if not (diff[-1] > diff[-2] > diff[-3]):
-            return False
-    if direction == "SELL":
-        if np.sum(diff < 0) < 8:
-            return False
-        if not (diff[-1] < diff[-2] < diff[-3]):
-            return False
-    return True
 
-# ================================
-# ENTRY CONFIRM (STRONG MOVE ONLY)
-# ================================
-def entry_confirm(p, direction):
-    if len(p) < 15:
+    std = np.std(p[-20:])
+    mean = np.mean(p[-20:])
+
+    # tight compression before move
+    if std > 0.006 * mean:
         return False
-    diff = np.diff(p[-10:])
+
+    diff = np.diff(p[-6:])
+
     if direction == "BUY":
-        return np.sum(diff > 0) >= 8
-    if direction == "SELL":
-        return np.sum(diff < 0) >= 8
+        return np.all(diff > 0) and diff[-1] > diff[-2]
+    elif direction == "SELL":
+        return np.all(diff < 0) and diff[-1] < diff[-2]
+
     return False
 
 # ================================
-# ACCURACY BASED ON MARKET CONDITION
+# ACCURACY
 # ================================
 def get_accuracy(p):
     if len(p) < 50:
@@ -131,8 +116,6 @@ SIGNAL ⚠️
 
 Asset: {pair}_otc
 Expiration: M{EXPIRY_MINUTES}
-
-Preparing entry...
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id":CHAT_ID,"text":msg})
@@ -167,7 +150,8 @@ async def load_symbols():
 # MAIN
 # ================================
 async def monitor():
-    global pending_signal
+    global asset_sent
+
     while True:
         try:
             symbols = await load_symbols()
@@ -202,7 +186,12 @@ async def monitor():
                     if not direction:
                         continue
 
-                    # tick confirm
+                    # send asset first (only once)
+                    if asset_sent != pair:
+                        send_asset(pair)
+                        asset_sent = pair
+
+                    # tick confirmation
                     if tick_confirm[pair]["dir"] == direction:
                         tick_confirm[pair]["count"] += 1
                     else:
@@ -211,18 +200,15 @@ async def monitor():
                     if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                         continue
 
-                    # BIG MOVE ONLY
-                    if not big_move_ready(prices[pair], direction):
+                    # EXPLOSION ENTRY (KEY FIX)
+                    if not explosion_ready(prices[pair], direction):
                         continue
 
-                    # SEND SIGNAL IMMEDIATELY
                     acc = get_accuracy(prices[pair])
-                    send_asset(pair)
-                    if entry_confirm(prices[pair], direction):
-                        send_final(pair, direction, acc)
-                        set_lock()
+                    send_final(pair, direction, acc)
 
-                    pending_signal = None
+                    set_lock()
+                    asset_sent = None
 
         except:
             await asyncio.sleep(5)
