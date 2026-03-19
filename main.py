@@ -2,7 +2,7 @@
 # DERIV OTC SIGNAL BOT
 # FULLY ENHANCED: POCKETOPTION-STYLE SIGNALS
 # HISTORICAL PATTERN + SMART ENTRY + ACCURACY MATCH
-# GLOBAL LOCK ENABLED
+# GLOBAL LOCK ENABLED + PRE-ENTRY STABILITY CHECK
 # ======================================
 
 import asyncio
@@ -115,6 +115,20 @@ def predictive_valid(price_list, direction):
     return False
 
 # ================================
+# PRE-ENTRY STABILITY CHECK
+# ================================
+def entry_stable(price_list, direction):
+    # Ensure market is unlikely to flip before entry
+    if len(price_list) < 5:
+        return False
+    recent_moves = np.diff(price_list[-5:])
+    if direction=="BUY":
+        return np.all(recent_moves >= 0)
+    elif direction=="SELL":
+        return np.all(recent_moves <= 0)
+    return False
+
+# ================================
 # SIGNAL LOCK
 # ================================
 def signal_active(pair=None):
@@ -147,6 +161,9 @@ def get_flag(code):
 def send_signal(pair,direction,accuracy,strength):
     now_time = datetime.now(TIMEZONE)
     if signal_active():  # <-- check global lock
+        return
+    # pre-entry stability check
+    if not entry_stable(prices[pair], direction):
         return
     now = now_time
     entry_time = now + timedelta(minutes=ENTRY_DELAY)
