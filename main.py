@@ -2,7 +2,7 @@
 # DERIV OTC SIGNAL BOT
 # FULLY ENHANCED: POCKETOPTION-STYLE SIGNALS
 # HISTORICAL PATTERN + SMART ENTRY + ACCURACY MATCH
-# GLOBAL LOCK ENABLED + PRE-ENTRY STABILITY CHECK
+# GLOBAL LOCK + PRE-ENTRY STABILITY
 # ======================================
 
 import asyncio
@@ -12,6 +12,7 @@ import websockets
 import logging
 import numpy as np
 from datetime import datetime, timedelta
+from collections import deque
 import pytz
 
 BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
@@ -38,7 +39,7 @@ tick_confirm = {}
 pending_signal = {}
 active_signal = {}
 last_global_signal_time = None
-global_lock_active = None  # <-- Global lock for all pairs
+global_lock_active = None  # Global lock for all pairs
 
 # ================================
 # EMA CALCULATION
@@ -90,7 +91,7 @@ def detect_trend(price_list):
     ema_slow = ema(price_list[-100:],20)
     ema_long_fast = ema(price_list[-200:],30)
     ema_long_slow = ema(price_list[-300:],60)
-    direction=None
+    direction = None
     if ema_fast and ema_slow and ema_long_fast and ema_long_slow:
         if ema_fast>ema_slow and ema_long_fast>ema_long_slow:
             direction="BUY"
@@ -115,24 +116,9 @@ def predictive_valid(price_list, direction):
     return False
 
 # ================================
-# PRE-ENTRY STABILITY CHECK
-# ================================
-def entry_stable(price_list, direction):
-    # Ensure market is unlikely to flip before entry
-    if len(price_list) < 5:
-        return False
-    recent_moves = np.diff(price_list[-5:])
-    if direction=="BUY":
-        return np.all(recent_moves >= 0)
-    elif direction=="SELL":
-        return np.all(recent_moves <= 0)
-    return False
-
-# ================================
-# SIGNAL LOCK
+# SIGNAL LOCKS
 # ================================
 def signal_active(pair=None):
-    global global_lock_active
     now = datetime.now(TIMEZONE)
     if global_lock_active and now < global_lock_active:
         return True
@@ -145,7 +131,7 @@ def register_signal(pair):
     now = datetime.now(TIMEZONE)
     total_lock = ENTRY_DELAY + MG_STEP*MAX_MG_STEPS + EXPIRY_MINUTES
     active_signal[pair] = now + timedelta(minutes=total_lock)
-    global_lock_active = now + timedelta(minutes=total_lock)  # <-- Global lock applied
+    global_lock_active = now + timedelta(minutes=total_lock)
 
 # ================================
 # FLAG EMOJIS
@@ -160,10 +146,7 @@ def get_flag(code):
 # ================================
 def send_signal(pair,direction,accuracy,strength):
     now_time = datetime.now(TIMEZONE)
-    if signal_active():  # <-- check global lock
-        return
-    # pre-entry stability check
-    if not entry_stable(prices[pair], direction):
+    if signal_active():  # check global lock
         return
     now = now_time
     entry_time = now + timedelta(minutes=ENTRY_DELAY)
@@ -211,7 +194,7 @@ async def monitor():
                 await asyncio.sleep(5)
                 continue
             for s in symbols:
-                prices[s] = []
+                prices[s] = deque(maxlen=MAX_PRICES)
                 tick_confirm[s] = {"count":0,"direction":None}
                 pending_signal[s] = None
             async with websockets.connect(DERIV_WS) as ws:
@@ -224,8 +207,6 @@ async def monitor():
                     pair = data["tick"]["symbol"]
                     price = data["tick"]["quote"]
                     prices[pair].append(price)
-                    if len(prices[pair]) > MAX_PRICES:
-                        prices[pair].pop(0)
                     accuracy,strength,direction = detect_trend(prices[pair])
                     if direction and accuracy >= TREND_SCORE_THRESHOLD and strength >= FIXED_STRENGTH:
                         if tick_confirm[pair]["direction"] == direction:
@@ -238,6 +219,7 @@ async def monitor():
                     if pending_signal.get(pair) and not signal_active():
                         dir_check,acc_check,str_check = pending_signal[pair]
                         acc2,str2,dir2 = detect_trend(prices[pair])
+                        # Pre-entry stability check
                         if dir2 == dir_check and predictive_valid(prices[pair],dir_check):
                             send_signal(pair,dir2,acc2,str2)
                         pending_signal[pair] = None
