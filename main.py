@@ -1,8 +1,8 @@
 # ======================================
 # DERIV OTC SIGNAL BOT
 # POCKETOPTION-STYLE (STRICT + REAL ENTRY)
-# FINAL VERSION: MARKET-CONDITION ACCURACY + 2 SIGNALS/HOUR
-# ======================================
+# FINAL VERSION: MARKET-CONDITION ACCURACY + FAST TREND DETECTION
+# ======================================  
 
 import asyncio
 import json
@@ -33,7 +33,6 @@ prices = {}
 tick_confirm = {}
 pending_signal = None
 global_lock = None
-last_signal_times = {}  # track last signal time per pair
 
 # ================================
 # EMA
@@ -48,16 +47,17 @@ def ema(data, period):
     return val
 
 # ================================
-# TREND
+# TREND (FAST DETECTION)
 # ================================
 def detect_trend(p):
-    if len(p) < 300:
+    if len(p) < 50:
         return None
 
-    e1 = ema(p[-50:],10)
-    e2 = ema(p[-100:],20)
-    e3 = ema(p[-200:],30)
-    e4 = ema(p[-300:],60)
+    # Shorter EMAs for faster detection
+    e1 = ema(p[-10:],3)     # fast EMA
+    e2 = ema(p[-20:],5)     # medium EMA
+    e3 = ema(p[-30:],8)     # slow EMA
+    e4 = ema(p[-50:],13)    # longer EMA
 
     if not all([e1,e2,e3,e4]):
         return None
@@ -78,7 +78,6 @@ def big_move_ready(p, direction):
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
 
-    # compression (like PO)
     if std > 0.01 * mean:
         return False
 
@@ -129,22 +128,14 @@ def get_accuracy(p):
 # ================================
 # LOCK
 # ================================
-def locked(pair):
+def locked():
     global global_lock
-    if global_lock and datetime.now(TIMEZONE) < global_lock:
-        return True
-    # enforce max 2 signals per hour
-    if pair in last_signal_times:
-        delta = datetime.now(TIMEZONE) - last_signal_times[pair]
-        if delta.total_seconds() < 1800:  # 30 min between signals
-            return True
-    return False
+    return global_lock and datetime.now(TIMEZONE) < global_lock
 
-def set_lock(pair):
-    global global_lock, last_signal_times
+def set_lock():
+    global global_lock
     total = ENTRY_DELAY + EXPIRY_MINUTES
     global_lock = datetime.now(TIMEZONE) + timedelta(minutes=total)
-    last_signal_times[pair] = datetime.now(TIMEZONE)
 
 # ================================
 # TELEGRAM
@@ -205,8 +196,6 @@ async def monitor():
             for s in symbols:
                 prices[s] = []
                 tick_confirm[s] = {"count":0,"dir":None}
-                if s not in last_signal_times:
-                    last_signal_times[s] = datetime.now(TIMEZONE) - timedelta(minutes=60)
 
             async with websockets.connect(DERIV_WS) as ws:
                 for s in symbols:
@@ -224,7 +213,7 @@ async def monitor():
                     if len(prices[pair]) > MAX_PRICES:
                         prices[pair].pop(0)
 
-                    if locked(pair):
+                    if locked():
                         continue
 
                     direction = detect_trend(prices[pair])
@@ -255,11 +244,11 @@ async def monitor():
                     # WAIT FOR ENTRY TIME CONFIRMATION
                     await asyncio.sleep(ENTRY_DELAY * 60)
 
-                    # FINAL CHECK
+                    # FINAL CHECK (cancel if weak)
                     acc = get_accuracy(prices[pair])
                     if entry_confirm(prices[pair], direction):
                         send_final(pair, direction, acc)
-                        set_lock(pair)
+                        set_lock()
 
                     pending_signal = None
 
