@@ -2,7 +2,7 @@
 # DERIV OTC SIGNAL BOT
 # FULLY ENHANCED: POCKETOPTION-STYLE SIGNALS
 # HISTORICAL PATTERN + SMART ENTRY + ACCURACY MATCH
-# GLOBAL LOCK + PRE-ENTRY STABILITY
+# STRICT PRE-ENTRY CHECK + GLOBAL LOCK
 # ======================================
 
 import asyncio
@@ -12,7 +12,6 @@ import websockets
 import logging
 import numpy as np
 from datetime import datetime, timedelta
-from collections import deque
 import pytz
 
 BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
@@ -54,7 +53,7 @@ def ema(data, period):
     return value
 
 # ================================
-# TREND STRENGTH
+# TREND STRENGTH (fixed)
 # ================================
 def trend_strength(price_list):
     if len(price_list) < 150:
@@ -91,7 +90,7 @@ def detect_trend(price_list):
     ema_slow = ema(price_list[-100:],20)
     ema_long_fast = ema(price_list[-200:],30)
     ema_long_slow = ema(price_list[-300:],60)
-    direction = None
+    direction=None
     if ema_fast and ema_slow and ema_long_fast and ema_long_slow:
         if ema_fast>ema_slow and ema_long_fast>ema_long_slow:
             direction="BUY"
@@ -116,9 +115,38 @@ def predictive_valid(price_list, direction):
     return False
 
 # ================================
-# SIGNAL LOCKS
+# STRICT PRE-ENTRY CHECK
+# Ensures trend stability at entry time
+# ================================
+def pre_entry_stable(price_list, direction):
+    if len(price_list) < 20 or not direction:
+        return False
+    # Check multiple short-term windows
+    windows = [10, 15, 20]
+    for w in windows:
+        if len(price_list) < w:
+            continue
+        recent_diff = np.diff(price_list[-w:])
+        if direction=="BUY" and np.sum(recent_diff>0) < w*0.7:
+            return False
+        elif direction=="SELL" and np.sum(recent_diff<0) < w*0.7:
+            return False
+    # Volatility filter: prevent erratic flips
+    if np.std(price_list[-20:]) > 0.02*np.mean(price_list[-20:]):  # 2% relative std
+        return False
+    # Projected trend at entry
+    ema_proj = ema(price_list[-10:],5)
+    if direction=="BUY" and ema_proj < price_list[-1]:
+        return False
+    elif direction=="SELL" and ema_proj > price_list[-1]:
+        return False
+    return True
+
+# ================================
+# SIGNAL LOCK
 # ================================
 def signal_active(pair=None):
+    global global_lock_active
     now = datetime.now(TIMEZONE)
     if global_lock_active and now < global_lock_active:
         return True
@@ -146,7 +174,7 @@ def get_flag(code):
 # ================================
 def send_signal(pair,direction,accuracy,strength):
     now_time = datetime.now(TIMEZONE)
-    if signal_active():  # check global lock
+    if signal_active():  # global + pair lock
         return
     now = now_time
     entry_time = now + timedelta(minutes=ENTRY_DELAY)
@@ -194,7 +222,7 @@ async def monitor():
                 await asyncio.sleep(5)
                 continue
             for s in symbols:
-                prices[s] = deque(maxlen=MAX_PRICES)
+                prices[s] = []
                 tick_confirm[s] = {"count":0,"direction":None}
                 pending_signal[s] = None
             async with websockets.connect(DERIV_WS) as ws:
@@ -207,22 +235,29 @@ async def monitor():
                     pair = data["tick"]["symbol"]
                     price = data["tick"]["quote"]
                     prices[pair].append(price)
+                    if len(prices[pair]) > MAX_PRICES:
+                        prices[pair].pop(0)
+
                     accuracy,strength,direction = detect_trend(prices[pair])
+
+                    # Tick confirmation + predictive + strict pre-entry
                     if direction and accuracy >= TREND_SCORE_THRESHOLD and strength >= FIXED_STRENGTH:
                         if tick_confirm[pair]["direction"] == direction:
                             tick_confirm[pair]["count"] += 1
                         else:
                             tick_confirm[pair] = {"direction":direction,"count":1}
                         if tick_confirm[pair]["count"] >= TICK_CONFIRMATION:
-                            if predictive_valid(prices[pair],direction):
+                            if predictive_valid(prices[pair],direction) and pre_entry_stable(prices[pair],direction):
                                 pending_signal[pair] = (direction,accuracy,strength)
-                    if pending_signal.get(pair) and not signal_active():
+
+                    # Send confirmed signal
+                    if pending_signal.get(pair) and not signal_active(pair):
                         dir_check,acc_check,str_check = pending_signal[pair]
                         acc2,str2,dir2 = detect_trend(prices[pair])
-                        # Pre-entry stability check
-                        if dir2 == dir_check and predictive_valid(prices[pair],dir_check):
+                        if dir2 == dir_check and predictive_valid(prices[pair],dir_check) and pre_entry_stable(prices[pair],dir2):
                             send_signal(pair,dir2,acc2,str2)
                         pending_signal[pair] = None
+
         except:
             logging.info("Reconnecting...")
             await asyncio.sleep(RETRY_SECONDS)
