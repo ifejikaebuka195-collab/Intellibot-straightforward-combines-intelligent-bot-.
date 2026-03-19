@@ -1,7 +1,7 @@
 # ======================================
 # DERIV OTC SIGNAL BOT
-# POCKETOPTION-STYLE: DYNAMIC DURATION & MASSIVE MOVE
-# FINAL VERSION: MARKET-CONDITION ACCURACY & EXPIRY DURATION
+# POCKETOPTION-STYLE (STRICT + REAL ENTRY)
+# FINAL VERSION: FAST TREND + MASSIVE MOVE CONFIRMATION
 # ======================================
 
 import asyncio
@@ -18,7 +18,8 @@ CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
-ENTRY_DELAY = 2  # minutes before entering
+EXPIRY_MINUTES = 5
+
 MAX_PRICES = 5000
 TICK_CONFIRMATION = 3
 
@@ -33,7 +34,7 @@ pending_signal = None
 global_lock = None
 
 # ================================
-# EMA CALCULATION
+# EMA
 # ================================
 def ema(data, period):
     if len(data) < period:
@@ -45,20 +46,17 @@ def ema(data, period):
     return val
 
 # ================================
-# TREND DETECTION
+# TREND (FAST DETECTION)
 # ================================
 def detect_trend(p):
-    if len(p) < 300:
+    if len(p) < 50:
         return None
-
-    e1 = ema(p[-50:],10)
-    e2 = ema(p[-100:],20)
-    e3 = ema(p[-200:],30)
-    e4 = ema(p[-300:],60)
-
+    e1 = ema(p[-10:],3)
+    e2 = ema(p[-20:],5)
+    e3 = ema(p[-30:],8)
+    e4 = ema(p[-50:],13)
     if not all([e1,e2,e3,e4]):
         return None
-
     if e1 > e2 and e3 > e4:
         return "BUY"
     elif e1 < e2 and e3 < e4:
@@ -66,59 +64,50 @@ def detect_trend(p):
     return None
 
 # ================================
-# MASSIVE MOVE DETECTION
+# BIG MOVE DETECTION 🔥
 # ================================
-def massive_move_ready(p, direction):
+def big_move_ready(p, direction):
     if len(p) < 50:
         return False
-
+    std = np.std(p[-30:])
+    mean = np.mean(p[-30:])
+    if std > 0.01 * mean:
+        return False
     diff = np.diff(p[-10:])
-    # Early strong directional move
     if direction == "BUY":
-        return np.sum(diff>0)>=7 and diff[-1]>diff[-2]
-    elif direction == "SELL":
-        return np.sum(diff<0)>=7 and diff[-1]<diff[-2]
-    return False
+        if np.sum(diff > 0) < 8:
+            return False
+        if not (diff[-1] > diff[-2] > diff[-3]):
+            return False
+    if direction == "SELL":
+        if np.sum(diff < 0) < 8:
+            return False
+        if not (diff[-1] < diff[-2] < diff[-3]):
+            return False
+    return True
 
 # ================================
-# ENTRY CONFIRMATION
+# ENTRY CONFIRM (STRONG MOVE ONLY)
 # ================================
 def entry_confirm(p, direction):
     if len(p) < 15:
         return False
     diff = np.diff(p[-10:])
     if direction == "BUY":
-        return np.sum(diff>0)>=8
-    elif direction == "SELL":
-        return np.sum(diff<0)>=8
+        return np.sum(diff > 0) >= 8
+    if direction == "SELL":
+        return np.sum(diff < 0) >= 8
     return False
-
-# ================================
-# DYNAMIC DURATION BASED ON VOLATILITY
-# ================================
-def get_dynamic_duration(p):
-    if len(p)<50:
-        return 2  # M2
-    std = np.std(p[-30:])
-    mean = np.mean(p[-30:])
-    volatility = std/mean
-    # Assign duration based on market activity
-    if volatility>0.01:
-        return 5  # strong move → M5
-    elif volatility>0.005:
-        return 2  # moderate → M2
-    else:
-        return 1  # low → M1
 
 # ================================
 # ACCURACY BASED ON MARKET CONDITION
 # ================================
 def get_accuracy(p):
-    if len(p)<50:
+    if len(p) < 50:
         return 82
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
-    if std/mean>0.005:
+    if std/mean > 0.005:
         return 85
     return 82
 
@@ -127,38 +116,28 @@ def get_accuracy(p):
 # ================================
 def locked():
     global global_lock
-    return global_lock and datetime.now(TIMEZONE)<global_lock
+    return global_lock and datetime.now(TIMEZONE) < global_lock
 
-def set_lock(duration):
+def set_lock():
     global global_lock
-    global_lock = datetime.now(TIMEZONE) + timedelta(minutes=duration)
+    global_lock = datetime.now(TIMEZONE) + timedelta(minutes=EXPIRY_MINUTES)
 
 # ================================
-# TELEGRAM MESSAGES
+# TELEGRAM
 # ================================
 def send_asset(pair):
     msg = f"""
 SIGNAL ⚠️
 
 Asset: {pair}_otc
+Expiration: M{EXPIRY_MINUTES}
+
 Preparing entry...
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id":CHAT_ID,"text":msg})
 
-def send_duration(pair, duration):
-    msg = f"""
-DURATION CONFIRMED ⏱
-
-Asset: {pair}_otc
-Duration: M{duration}
-Preparing final entry...
-"""
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                  data={"chat_id":CHAT_ID,"text":msg})
-
-def send_final(pair, direction, acc, duration):
-    entry = datetime.now(TIMEZONE) + timedelta(minutes=ENTRY_DELAY)
+def send_final(pair, direction, acc):
     arrow = "⬆️" if direction=="BUY" else "⬇️"
     msg = f"""
 SIGNAL {arrow}
@@ -166,8 +145,7 @@ SIGNAL {arrow}
 Asset: {pair}_otc
 Payout: 92%
 Accuracy: {acc}%
-Expiration: M{duration}
-Entry Time: {entry.strftime('%I:%M %p')}
+Expiration: M{EXPIRY_MINUTES}
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id":CHAT_ID,"text":msg})
@@ -186,7 +164,7 @@ async def load_symbols():
         return []
 
 # ================================
-# MAIN MONITOR LOOP
+# MAIN
 # ================================
 async def monitor():
     global pending_signal
@@ -214,7 +192,7 @@ async def monitor():
                     price = data["tick"]["quote"]
 
                     prices[pair].append(price)
-                    if len(prices[pair])>MAX_PRICES:
+                    if len(prices[pair]) > MAX_PRICES:
                         prices[pair].pop(0)
 
                     if locked():
@@ -224,35 +202,25 @@ async def monitor():
                     if not direction:
                         continue
 
-                    # Tick confirmation
-                    if tick_confirm[pair]["dir"]==direction:
-                        tick_confirm[pair]["count"]+=1
+                    # tick confirm
+                    if tick_confirm[pair]["dir"] == direction:
+                        tick_confirm[pair]["count"] += 1
                     else:
-                        tick_confirm[pair]={"dir":direction,"count":1}
+                        tick_confirm[pair] = {"dir":direction,"count":1}
 
-                    if tick_confirm[pair]["count"]<TICK_CONFIRMATION:
+                    if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                         continue
 
-                    # Massive move detection
-                    if not massive_move_ready(prices[pair], direction):
+                    # BIG MOVE ONLY
+                    if not big_move_ready(prices[pair], direction):
                         continue
 
-                    # Send asset first
-                    send_asset(pair)
-
-                    # Determine dynamic duration
-                    duration = get_dynamic_duration(prices[pair])
-                    send_duration(pair, duration)
-
-                    pending_signal = {"pair":pair,"direction":direction,"time":datetime.now(TIMEZONE)}
-
-                    # Wait for entry confirmation
-                    await asyncio.sleep(ENTRY_DELAY*60)
-
+                    # SEND SIGNAL IMMEDIATELY
                     acc = get_accuracy(prices[pair])
+                    send_asset(pair)
                     if entry_confirm(prices[pair], direction):
-                        send_final(pair, direction, acc, duration)
-                        set_lock(duration)
+                        send_final(pair, direction, acc)
+                        set_lock()
 
                     pending_signal = None
 
