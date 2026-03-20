@@ -27,7 +27,6 @@ MIN_SIGNALS_PER_HOUR = 1
 MAX_SIGNALS_PER_HOUR = 2
 MIN_SIGNAL_INTERVAL = 1800  # 30 minutes minimum between signals
 EXPLOSION_THRESHOLD = 0.01  # 1% rapid move defines an explosion
-EXPLOSION_BOOST = 5         # Boost accuracy by 5% when explosion detected
 
 # ----------------------
 # GLOBAL STATE
@@ -100,7 +99,7 @@ def detect_explosion(p,direction):
     return False
 
 # ----------------------
-# ACCURACY CALCULATION WITH EXPLOSION BOOST
+# ACCURACY CALCULATION
 # ----------------------
 def calculate_accuracy(p,direction):
     score=0
@@ -119,12 +118,6 @@ def calculate_accuracy(p,direction):
     last_diff = np.diff(p[-OBSERVATION_TICKS:])
     if direction=="BUY" and np.all(last_diff>0): score+=adaptive_weights["pullback"]*100
     if direction=="SELL" and np.all(last_diff<0): score+=adaptive_weights["pullback"]*100
-
-    # --- Explosion boost ---
-    if detect_explosion(p,direction):
-        logging.info(f"Explosion boost applied for {direction}")
-        score += EXPLOSION_BOOST
-
     accuracy = min(score,100)
     return max(MIN_ACCURACY,min(accuracy,MAX_ACCURACY))
 
@@ -144,27 +137,23 @@ def update_adaptive_weights(pair,direction,result):
 # ----------------------
 # TELEGRAM
 # ----------------------
-def send_asset(pair, explosion=False):
-    move_type = "BIG MOVE ⚡" if explosion else "STEADY MOVE ⚡"
+def send_asset(pair):
     msg=f"""SIGNAL ⚠️
 Asset: {pair}_otc
-Type: {move_type}
 Expiration: M{EXPIRY_MINUTES}
-Observing market for move..."""
+Observing market for stable move..."""
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":msg})
-    logging.info(f"Asset observation started: {pair} | {move_type}")
+    logging.info(f"Asset observation started: {pair}")
 
-def send_final(pair,direction,acc, explosion=False):
-    move_type = "BIG MOVE ⚡" if explosion else "STEADY MOVE ⚡"
+def send_final(pair,direction,acc):
     arrow="⬆️" if direction=="BUY" else "⬇️"
     msg=f"""SIGNAL {arrow}
 Asset: {pair}_otc
-Type: {move_type}
 Payout: 92%
 Accuracy: {acc}%
 Expiration: M{EXPIRY_MINUTES}"""
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":msg})
-    logging.info(f"Final signal sent: {pair} {direction} Accuracy: {acc}% | {move_type}")
+    logging.info(f"Final signal sent: {pair} {direction} Accuracy: {acc}%")
 
 # ----------------------
 # LOAD SYMBOLS
@@ -180,7 +169,7 @@ async def load_symbols():
         return []
 
 # ----------------------
-# MONITOR LOOP WITH PRE-SIGNAL CONFIRMATION AND EXPLOSION PRIORITY
+# MONITOR LOOP WITH PRE-SIGNAL CONFIRMATION AND EXPLOSION DETECTION
 # ----------------------
 async def monitor():
     global active_pair, last_signal_time, signals_sent_this_hour
@@ -188,7 +177,6 @@ async def monitor():
     while True:
         try:
             now = datetime.now(TIMEZONE)
-            # reset hourly counter
             if now.minute==0 and now.second<5:
                 signals_sent_this_hour=0
 
@@ -228,7 +216,9 @@ async def monitor():
                         if not is_stable_and_no_pullback(list(prices[pair]),direction): continue
                         if not is_market_stable(list(prices[pair])): continue
 
-                        explosion = detect_explosion(list(prices[pair]),direction)
+                        # --- EXPLOSION DETECTION ---
+                        if detect_explosion(list(prices[pair]),direction):
+                            logging.info(f"Explosion detected on {pair} {direction}")
 
                         # --- PRE-SIGNAL OBSERVATION ---
                         observation_start = datetime.now(TIMEZONE)
@@ -246,9 +236,9 @@ async def monitor():
                             signals_sent_this_hour+=1
                             last_signal_time=datetime.now(TIMEZONE)
 
-                            send_asset(pair, explosion)
+                            send_asset(pair)
                             await asyncio.sleep(2)
-                            send_final(pair,direction,acc, explosion)
+                            send_final(pair,direction,acc)
 
                             # Wait for expiry
                             await asyncio.sleep(EXPIRY_MINUTES*60)
@@ -270,5 +260,4 @@ async def monitor():
 # ----------------------
 # RUN
 # ----------------------
-if __name__=="__main__":
-    asyncio.run(monitor())
+asyncio.run(monitor())
