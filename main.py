@@ -19,6 +19,7 @@ EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
 OBSERVATION_TICKS = 15
 BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
+LOSS_FREEZE_COUNT = 2  # Freeze pair after this many consecutive losses
 
 # ----------------------
 # GLOBAL STATE
@@ -26,6 +27,7 @@ BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 prices = {}
 historical_memory = {}
 signal_history = defaultdict(list)
+pair_losses = defaultdict(int)  # Track consecutive losses per pair
 adaptive_weights = {
     "ema": 0.25,
     "momentum": 0.25,
@@ -130,13 +132,17 @@ def update_adaptive_weights(pair, direction, result):
     signal_history[pair].append(result)
     if len(signal_history[pair]) > 100:
         signal_history[pair].pop(0)
-    success_rate = np.mean(signal_history[pair])
     for key in adaptive_weights:
         if result:
             adaptive_weights[key] = min(0.4, adaptive_weights[key]+0.01)
         else:
             adaptive_weights[key] = max(0.15, adaptive_weights[key]-0.01)
-    logging.info(f"Adaptive weights updated: {adaptive_weights}")
+    # Track consecutive losses for freeze
+    if not result:
+        pair_losses[pair] += 1
+    else:
+        pair_losses[pair] = 0
+    logging.info(f"Adaptive weights updated: {adaptive_weights} | Pair losses: {dict(pair_losses)}")
 
 # ----------------------
 # TELEGRAM FUNCTIONS
@@ -180,13 +186,14 @@ async def load_symbols():
         return []
 
 # ----------------------
-# MONITOR LOOP WITH AUTONOMOUS LEARNING
+# MONITOR LOOP WITH GLOBAL LOCK & AUTONOMOUS LEARNING
 # ----------------------
 async def monitor():
     global active_signal, cooldown_until
 
     while True:
         try:
+            # Respect global cooldown
             if cooldown_until and datetime.now(TIMEZONE) < cooldown_until:
                 await asyncio.sleep(1)
                 continue
@@ -215,9 +222,14 @@ async def monitor():
                         pair = data["tick"]["symbol"]
                         price = data["tick"]["quote"]
 
+                        # Skip frozen pairs
+                        if pair_losses[pair] >= LOSS_FREEZE_COUNT:
+                            continue
+
                         prices[pair].append(price)
                         historical_memory[pair].append(price)
 
+                        # If a signal is already active, wait for it to expire
                         if active_signal:
                             continue
 
@@ -230,17 +242,20 @@ async def monitor():
                             send_asset(pair)
                             send_final(pair, direction, acc)
 
-                            # Autonomous learning: check after expiry
+                            # Lock global signal until expiry
+                            active_signal = pair
+                            cooldown_until = datetime.now(TIMEZONE) + timedelta(minutes=EXPIRY_MINUTES)
+
+                            # Check result after expiry
                             await asyncio.sleep(EXPIRY_MINUTES * 60)
                             final_price = historical_memory[pair][-1]
                             result = (direction=="BUY" and final_price > prices[pair][-1]) or \
                                      (direction=="SELL" and final_price < prices[pair][-1])
                             update_adaptive_weights(pair, direction, result)
 
-                            active_signal = pair
-                            cooldown_until = datetime.now(TIMEZONE) + timedelta(minutes=EXPIRY_MINUTES)
+                            # Reset active signal after expiry
+                            active_signal = None
                             prices[pair].clear()
-                            break
 
                     except Exception as e_tick:
                         logging.error(f"Tick error: {e_tick}")
