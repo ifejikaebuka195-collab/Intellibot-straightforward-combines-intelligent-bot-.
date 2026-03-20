@@ -16,15 +16,15 @@ CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 EXPIRY_MINUTES = 5
-OBSERVATION_TICKS = 20  # Increase for better trend verification
+MAX_PRICES = 5000
+OBSERVATION_TICKS = 15
 BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 LOSS_FREEZE_COUNT = 2
-MIN_ACCURACY = 85  # stricter filter for high-quality signals
-MAX_ACCURACY = 99
+MIN_ACCURACY = 82
+MAX_ACCURACY = 95
 MIN_SIGNALS_PER_HOUR = 1
 MAX_SIGNALS_PER_HOUR = 2
 MIN_SIGNAL_INTERVAL = 1800  # 30 minutes minimum between global signals
-LONG_TREND_OBSERVATION = 600  # 10 minutes observation for stable trend
 
 # ----------------------
 # GLOBAL STATE
@@ -34,7 +34,7 @@ historical_memory = {}
 signal_history = defaultdict(list)
 pair_losses = defaultdict(int)
 adaptive_weights = {"ema":0.25,"momentum":0.25,"volatility":0.25,"pullback":0.25}
-active_pair = None  # Global lock for one pair at a time
+active_signal = None  # Global lock: only 1 active signal at a time
 last_signal_time = datetime.min.replace(tzinfo=TIMEZONE)
 signals_sent_this_hour = 0
 
@@ -70,9 +70,9 @@ def detect_trend(p):
     return None
 
 # ----------------------
-# STABLE MOVE & LONG TREND CHECK
+# STABLE MOVE CHECK
 # ----------------------
-def is_stable_long_trend(p,direction):
+def is_stable_and_no_pullback(p, direction):
     if len(p) < OBSERVATION_TICKS + 5: return False
     last_diff = np.diff(p[-OBSERVATION_TICKS:])
     if direction=="BUY": return np.all(last_diff>0)
@@ -118,8 +118,8 @@ def update_adaptive_weights(pair,direction,result):
     signal_history[pair].append(result)
     if len(signal_history[pair])>100: signal_history[pair].pop(0)
     for k in adaptive_weights:
-        if result: adaptive_weights[k] = min(0.4, adaptive_weights[k]+0.01)
-        else: adaptive_weights[k] = max(0.15, adaptive_weights[k]-0.01)
+        if result: adaptive_weights[k]=min(0.4, adaptive_weights[k]+0.01)
+        else: adaptive_weights[k]=max(0.15, adaptive_weights[k]-0.01)
     if not result: pair_losses[pair]+=1
     else: pair_losses[pair]=0
     logging.info(f"Adaptive weights: {adaptive_weights} | Pair losses: {dict(pair_losses)}")
@@ -132,7 +132,7 @@ def send_asset(pair):
 Asset: {pair}_otc
 Expiration: M{EXPIRY_MINUTES}
 Observing market for stable move..."""
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":msg})
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":msg})
     logging.info(f"Asset observation started: {pair}")
 
 def send_final(pair,direction,acc):
@@ -142,7 +142,7 @@ Asset: {pair}_otc
 Payout: 92%
 Accuracy: {acc}%
 Expiration: M{EXPIRY_MINUTES}"""
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id":CHAT_ID, "text":msg})
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":msg})
     logging.info(f"Final signal sent: {pair} {direction} Accuracy: {acc}%")
 
 # ----------------------
@@ -159,88 +159,77 @@ async def load_symbols():
         return []
 
 # ----------------------
-# ELITE MONITOR LOOP
+# MONITOR LOOP
 # ----------------------
 async def monitor():
-    global active_pair, last_signal_time, signals_sent_this_hour
+    global active_signal,last_signal_time,signals_sent_this_hour
 
     while True:
         try:
             now = datetime.now(TIMEZONE)
-
             # Reset hourly counter
             if now.minute == 0 and now.second < 5:
                 signals_sent_this_hour = 0
 
             symbols = await load_symbols()
-            if not symbols or active_pair:
+            if not symbols or active_signal:
                 await asyncio.sleep(5)
                 continue
 
             for s in symbols:
-                if s not in prices: prices[s] = deque(maxlen=5000)
-                if s not in historical_memory: historical_memory[s] = deque(maxlen=1000)
+                if s not in prices: prices[s]=deque(maxlen=MAX_PRICES)
+                if s not in historical_memory: historical_memory[s]=deque(maxlen=1000)
 
             async with websockets.connect(DERIV_WS) as ws:
                 for pair in symbols: await ws.send(json.dumps({"ticks":pair,"subscribe":1}))
 
                 async for msg in ws:
                     try:
-                        data = json.loads(msg)
+                        data=json.loads(msg)
                         if "tick" not in data: continue
 
                         pair = data["tick"]["symbol"]
                         price = data["tick"]["quote"]
 
-                        if pair_losses[pair] >= LOSS_FREEZE_COUNT: continue
+                        if pair_losses[pair]>=LOSS_FREEZE_COUNT: continue
                         prices[pair].append(price)
                         historical_memory[pair].append(price)
 
-                        # Skip if global lock is active
-                        if active_pair: continue
+                        # Global lock: only 1 active signal at a time
+                        if active_signal: continue
 
-                        # Ensure 1-2 signals per hour
-                        seconds_since_last = (now - last_signal_time).total_seconds()
+                        # Ensure max signals per hour
+                        seconds_since_last = (now-last_signal_time).total_seconds()
                         if seconds_since_last < MIN_SIGNAL_INTERVAL or signals_sent_this_hour >= MAX_SIGNALS_PER_HOUR:
                             continue
 
-                        # Detect trend
                         direction = detect_trend(list(prices[pair]))
                         if not direction: continue
-                        if not is_stable_long_trend(list(prices[pair]), direction): continue
+                        if not is_stable_and_no_pullback(list(prices[pair]), direction): continue
                         if not is_market_stable(list(prices[pair])): continue
 
-                        # Long trend confirmation for 10 minutes observation
-                        await asyncio.sleep(LONG_TREND_OBSERVATION)
-
-                        # Re-check trend after long observation
-                        direction = detect_trend(list(prices[pair]))
-                        if not direction or not is_stable_long_trend(list(prices[pair]), direction): continue
-
-                        # Calculate accuracy
+                        # Calculate accuracy and filter for only high-probability signals
                         acc = calculate_accuracy(list(prices[pair]), direction)
                         if acc < MIN_ACCURACY: continue
 
-                        # Activate global lock
-                        active_pair = pair
+                        # Lock global signal
+                        active_signal = pair
                         signals_sent_this_hour += 1
                         last_signal_time = datetime.now(TIMEZONE)
 
-                        # Send asset observation
+                        # Send asset observation and final signal
                         send_asset(pair)
                         await asyncio.sleep(2)
                         send_final(pair, direction, acc)
 
-                        # Wait for expiry
-                        await asyncio.sleep(EXPIRY_MINUTES * 60)
+                        # Wait for expiry before unlocking
+                        await asyncio.sleep(EXPIRY_MINUTES*60)
 
-                        # Update adaptive weights based on result
                         final_price = historical_memory[pair][-1]
                         result = (direction=="BUY" and final_price>prices[pair][-1]) or (direction=="SELL" and final_price<prices[pair][-1])
-                        update_adaptive_weights(pair, direction, result)
+                        update_adaptive_weights(pair,direction,result)
 
-                        # Clear global lock
-                        active_pair = None
+                        active_signal = None
                         prices[pair].clear()
 
                     except Exception as e_tick:
