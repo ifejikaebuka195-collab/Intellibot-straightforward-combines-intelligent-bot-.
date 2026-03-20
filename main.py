@@ -15,6 +15,7 @@ import time
 BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
 CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+WEEKEND_WS = "wss://weekend-otc.example.com/ws"  # <-- Weekend broker WebSocket (Option A)
 TIMEZONE = pytz.timezone("Africa/Lagos")
 EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
@@ -165,11 +166,17 @@ def send_final(pair,direction,acc, move_type="Steady Trend"):
     logging.info(f"Final signal sent: {pair} {direction} Accuracy: {acc}% ({move_type})")
 
 # ----------------------
-# LOAD SYMBOLS
+# LOAD SYMBOLS (with automatic weekend switch)
 # ----------------------
 async def load_symbols():
+    now = datetime.now(TIMEZONE)
+    # Weekend switch: Friday 10 PM → Sunday 12 AM
+    if now.weekday() == 4 and now.hour >= 22 or now.weekday() == 5 or (now.weekday()==6 and now.hour < 0):
+        ws_url = WEEKEND_WS
+    else:
+        ws_url = DERIV_WS
     try:
-        async with websockets.connect(DERIV_WS) as ws:
+        async with websockets.connect(ws_url) as ws:
             await ws.send(json.dumps({"active_symbols":"brief"}))
             res = json.loads(await ws.recv())
             return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx") and s["symbol"] not in BLOCKED_PAIRS]
@@ -186,10 +193,10 @@ async def monitor_pairs(symbols):
         prices[pair] = deque(maxlen=MAX_PRICES)
         historical_memory[pair] = deque(maxlen=MAX_PRICES)
 
-    async def handle_single(pair):
+    async def handle_single(pair, ws_url):
         while True:
             try:
-                async with websockets.connect(DERIV_WS, ping_interval=PING_INTERVAL, ping_timeout=10) as ws:
+                async with websockets.connect(ws_url, ping_interval=PING_INTERVAL, ping_timeout=10) as ws:
                     await ws.send(json.dumps({"ticks":pair,"subscribe":1}))
                     async for msg in ws:
                         try:
@@ -208,6 +215,8 @@ async def monitor_pairs(symbols):
         global active_pair, last_signal_time, signals_sent_this_hour, current_hour
         while True:
             now = datetime.now(TIMEZONE)
+            # Automatic weekend switch logic
+            ws_url = WEEKEND_WS if (now.weekday() == 4 and now.hour >= 22) or now.weekday() in [5,6] else DERIV_WS
             if now.hour != current_hour:
                 signals_sent_this_hour = 0
                 current_hour = now.hour
@@ -239,7 +248,7 @@ async def monitor_pairs(symbols):
                     active_pair = None
             await asyncio.sleep(1)
 
-    tasks = [handle_single(pair) for pair in symbols] + [ranking_loop()]
+    tasks = [handle_single(pair, WEEKEND_WS if datetime.now(TIMEZONE).weekday() in [5,6] else DERIV_WS) for pair in symbols] + [ranking_loop()]
     await asyncio.gather(*tasks)
 
 # ----------------------
