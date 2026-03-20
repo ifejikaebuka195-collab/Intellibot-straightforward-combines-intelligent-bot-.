@@ -23,11 +23,11 @@ BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 LOSS_FREEZE_COUNT = 2
 MIN_ACCURACY = 82
 MAX_ACCURACY = 95
-MIN_SIGNALS_PER_HOUR = 1
+MIN_SIGNAL_INTERVAL = 1800  # 30 minutes between signals
 MAX_SIGNALS_PER_HOUR = 2
-MIN_SIGNAL_INTERVAL = 1800  # 30 minutes minimum between signals
 EXPLOSION_THRESHOLD = 0.01
 EXPLOSION_BOOST = 5
+PING_INTERVAL = 30  # WebSocket keepalive ping
 
 # ----------------------
 # GLOBAL STATE
@@ -120,7 +120,6 @@ def calculate_accuracy(p,direction):
     if direction=="BUY" and np.all(last_diff>0): score+=adaptive_weights["pullback"]*100
     if direction=="SELL" and np.all(last_diff<0): score+=adaptive_weights["pullback"]*100
 
-    # --- Explosion boost ---
     if detect_explosion(p,direction):
         logging.info(f"Explosion boost applied for {direction}")
         score += EXPLOSION_BOOST
@@ -178,54 +177,46 @@ async def load_symbols():
         return []
 
 # ----------------------
-# MONITOR LOOP
+# WEB SOCKET HANDLER WITH RECONNECT
 # ----------------------
-async def monitor():
+async def ws_loop(symbols):
     global active_pair, last_signal_time, signals_sent_this_hour
 
     while True:
         try:
-            now = datetime.now(TIMEZONE)
-            if now.minute==0 and now.second<5:
-                signals_sent_this_hour=0
-
-            symbols = await load_symbols()
-            if not symbols or active_pair:
-                await asyncio.sleep(5)
-                continue
-
-            for s in symbols:
-                if s not in prices: prices[s]=deque(maxlen=MAX_PRICES)
-                if s not in historical_memory: historical_memory[s]=deque(maxlen=1000)
-
-            async with websockets.connect(DERIV_WS) as ws:
-                for pair in symbols: await ws.send(json.dumps({"ticks":pair,"subscribe":1}))
+            async with websockets.connect(DERIV_WS, ping_interval=PING_INTERVAL, ping_timeout=10) as ws:
+                # Subscribe to all pairs
+                for pair in symbols:
+                    await ws.send(json.dumps({"ticks":pair,"subscribe":1}))
 
                 async for msg in ws:
                     try:
                         data=json.loads(msg)
                         if "tick" not in data: continue
-
                         pair=data["tick"]["symbol"]
                         price=data["tick"]["quote"]
 
                         if pair_losses[pair]>=LOSS_FREEZE_COUNT: continue
+                        if pair not in prices: prices[pair]=deque(maxlen=MAX_PRICES)
+                        if pair not in historical_memory: historical_memory[pair]=deque(maxlen=1000)
+
                         prices[pair].append(price)
                         historical_memory[pair].append(price)
 
+                        # Skip if another signal active
                         if active_pair: continue
 
-                        # Ensure 1–2 signals per hour
-                        seconds_since_last = (now-last_signal_time).total_seconds()
-                        if seconds_since_last<MIN_SIGNAL_INTERVAL or signals_sent_this_hour>=MAX_SIGNALS_PER_HOUR:
+                        # Check signal timing
+                        now = datetime.now(TIMEZONE)
+                        if signals_sent_this_hour>=MAX_SIGNALS_PER_HOUR or (now-last_signal_time).total_seconds()<MIN_SIGNAL_INTERVAL:
                             continue
 
+                        # Detect trend
                         direction=detect_trend(list(prices[pair]))
                         if not direction: continue
                         if not is_stable_and_no_pullback(list(prices[pair]),direction): continue
                         if not is_market_stable(list(prices[pair])): continue
 
-                        # Determine move type
                         move_type = "Big Move" if detect_explosion(list(prices[pair]),direction) else "Steady Trend"
 
                         # Pre-signal observation
@@ -247,9 +238,7 @@ async def monitor():
                             await asyncio.sleep(2)
                             send_final(pair,direction,acc, move_type)
 
-                            # Wait for expiry
                             await asyncio.sleep(EXPIRY_MINUTES*60)
-
                             final_price = historical_memory[pair][-1]
                             result=(direction=="BUY" and final_price>prices[pair][-1]) or (direction=="SELL" and final_price<prices[pair][-1])
                             update_adaptive_weights(pair,direction,result)
@@ -261,7 +250,20 @@ async def monitor():
                         logging.error(f"Tick error: {e_tick}")
 
         except Exception as e_outer:
-            logging.error(f"Main loop error: {e_outer}")
+            logging.error(f"WebSocket loop error: {e_outer} -- reconnecting in 5s")
+            await asyncio.sleep(5)
+
+# ----------------------
+# MAIN MONITOR
+# ----------------------
+async def monitor():
+    global signals_sent_this_hour
+    while True:
+        symbols = await load_symbols()
+        if symbols:
+            await ws_loop(symbols)
+        else:
+            logging.warning("No symbols loaded, retrying in 5s")
             await asyncio.sleep(5)
 
 # ----------------------
