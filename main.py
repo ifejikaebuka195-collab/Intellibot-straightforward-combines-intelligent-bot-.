@@ -18,7 +18,7 @@ TIMEZONE = pytz.timezone("Africa/Lagos")
 EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
 OBSERVATION_TICKS = 15
-PRE_SIGNAL_OBSERVATION = 120  # seconds to confirm move
+PRE_SIGNAL_OBSERVATION = 120  # seconds
 BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 LOSS_FREEZE_COUNT = 2
 MIN_ACCURACY = 82
@@ -26,7 +26,8 @@ MAX_ACCURACY = 95
 MIN_SIGNALS_PER_HOUR = 1
 MAX_SIGNALS_PER_HOUR = 2
 MIN_SIGNAL_INTERVAL = 1800  # 30 minutes minimum between signals
-EXPLOSION_THRESHOLD = 0.01  # 1% rapid move defines an explosion
+EXPLOSION_THRESHOLD = 0.01
+EXPLOSION_BOOST = 5
 
 # ----------------------
 # GLOBAL STATE
@@ -99,7 +100,7 @@ def detect_explosion(p,direction):
     return False
 
 # ----------------------
-# ACCURACY CALCULATION
+# ACCURACY CALCULATION WITH EXPLOSION BOOST
 # ----------------------
 def calculate_accuracy(p,direction):
     score=0
@@ -118,6 +119,12 @@ def calculate_accuracy(p,direction):
     last_diff = np.diff(p[-OBSERVATION_TICKS:])
     if direction=="BUY" and np.all(last_diff>0): score+=adaptive_weights["pullback"]*100
     if direction=="SELL" and np.all(last_diff<0): score+=adaptive_weights["pullback"]*100
+
+    # --- Explosion boost ---
+    if detect_explosion(p,direction):
+        logging.info(f"Explosion boost applied for {direction}")
+        score += EXPLOSION_BOOST
+
     accuracy = min(score,100)
     return max(MIN_ACCURACY,min(accuracy,MAX_ACCURACY))
 
@@ -137,23 +144,25 @@ def update_adaptive_weights(pair,direction,result):
 # ----------------------
 # TELEGRAM
 # ----------------------
-def send_asset(pair):
+def send_asset(pair, move_type="Steady Trend"):
     msg=f"""SIGNAL ⚠️
 Asset: {pair}_otc
 Expiration: M{EXPIRY_MINUTES}
+Move Type: {move_type}
 Observing market for stable move..."""
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":msg})
-    logging.info(f"Asset observation started: {pair}")
+    logging.info(f"Asset observation started: {pair} ({move_type})")
 
-def send_final(pair,direction,acc):
+def send_final(pair,direction,acc, move_type="Steady Trend"):
     arrow="⬆️" if direction=="BUY" else "⬇️"
     msg=f"""SIGNAL {arrow}
 Asset: {pair}_otc
 Payout: 92%
 Accuracy: {acc}%
-Expiration: M{EXPIRY_MINUTES}"""
+Expiration: M{EXPIRY_MINUTES}
+Move Type: {move_type}"""
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":msg})
-    logging.info(f"Final signal sent: {pair} {direction} Accuracy: {acc}%")
+    logging.info(f"Final signal sent: {pair} {direction} Accuracy: {acc}% ({move_type})")
 
 # ----------------------
 # LOAD SYMBOLS
@@ -169,7 +178,7 @@ async def load_symbols():
         return []
 
 # ----------------------
-# MONITOR LOOP WITH PRE-SIGNAL CONFIRMATION AND EXPLOSION DETECTION
+# MONITOR LOOP
 # ----------------------
 async def monitor():
     global active_pair, last_signal_time, signals_sent_this_hour
@@ -216,11 +225,10 @@ async def monitor():
                         if not is_stable_and_no_pullback(list(prices[pair]),direction): continue
                         if not is_market_stable(list(prices[pair])): continue
 
-                        # --- EXPLOSION DETECTION ---
-                        if detect_explosion(list(prices[pair]),direction):
-                            logging.info(f"Explosion detected on {pair} {direction}")
+                        # Determine move type
+                        move_type = "Big Move" if detect_explosion(list(prices[pair]),direction) else "Steady Trend"
 
-                        # --- PRE-SIGNAL OBSERVATION ---
+                        # Pre-signal observation
                         observation_start = datetime.now(TIMEZONE)
                         pre_prices = list(prices[pair])
                         while (datetime.now(TIMEZONE)-observation_start).total_seconds()<PRE_SIGNAL_OBSERVATION:
@@ -228,7 +236,6 @@ async def monitor():
                             pre_prices.append(prices[pair][-1])
                             if not is_stable_and_no_pullback(pre_prices,direction): break
                         else:
-                            # Confirmed move
                             acc = calculate_accuracy(pre_prices,direction)
                             if acc<MIN_ACCURACY: continue
 
@@ -236,9 +243,9 @@ async def monitor():
                             signals_sent_this_hour+=1
                             last_signal_time=datetime.now(TIMEZONE)
 
-                            send_asset(pair)
+                            send_asset(pair, move_type)
                             await asyncio.sleep(2)
-                            send_final(pair,direction,acc)
+                            send_final(pair,direction,acc, move_type)
 
                             # Wait for expiry
                             await asyncio.sleep(EXPIRY_MINUTES*60)
