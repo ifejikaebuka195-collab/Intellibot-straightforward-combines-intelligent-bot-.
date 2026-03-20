@@ -6,6 +6,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import pytz
 import logging
+from collections import deque, defaultdict
 
 # ----------------------
 # CONFIG
@@ -16,15 +17,22 @@ DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
-OBSERVATION_TICKS = 10  # Ticks to observe before final signal
+OBSERVATION_TICKS = 15
 BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 
 # ----------------------
 # GLOBAL STATE
 # ----------------------
 prices = {}
-tick_confirm = {}
-active_signal = None  # Only one active signal at a time
+historical_memory = {}
+signal_history = defaultdict(list)
+adaptive_weights = {
+    "ema": 0.25,
+    "momentum": 0.25,
+    "volatility": 0.25,
+    "pullback": 0.25
+}
+active_signal = None
 cooldown_until = None
 
 # ----------------------
@@ -63,26 +71,17 @@ def detect_trend(p):
     return None
 
 # ----------------------
-# STABLE TREND & PULLBACK CHECK
+# PULLBACK & STABLE MOVE CHECK
 # ----------------------
-def is_stable_with_no_pullback(p, direction):
-    """
-    Checks:
-    - Trend stability over observation ticks
-    - Detects pullback and waits until trend resumes
-    """
+def is_stable_and_no_pullback(p, direction):
     if len(p) < OBSERVATION_TICKS + 5:
         return False
-
     last_diff = np.diff(p[-OBSERVATION_TICKS:])
-    # Pullback detection: temporary reversal in last few ticks
     pullback = False
     if direction == "BUY" and np.any(last_diff < 0):
         pullback = True
     if direction == "SELL" and np.any(last_diff > 0):
         pullback = True
-
-    # Trend must be stable and no pullback
     if direction == "BUY":
         return np.all(last_diff > 0) and not pullback
     elif direction == "SELL":
@@ -90,47 +89,54 @@ def is_stable_with_no_pullback(p, direction):
     return False
 
 # ----------------------
-# ACCURACY SCORING
+# DYNAMIC ACCURACY SCORING WITH ADAPTIVE LEARNING
 # ----------------------
 def calculate_accuracy(p, direction):
-    """
-    Simulate PocketOption-style probability scoring.
-    """
     score = 0
     max_score = 100
-
-    # EMA alignment score
     e1 = ema(p[-10:],3)
     e2 = ema(p[-20:],5)
     e3 = ema(p[-30:],8)
     e4 = ema(p[-50:],13)
     if direction=="BUY" and e1>e2 and e3>e4:
-        score += 25
+        score += adaptive_weights["ema"]*100
     elif direction=="SELL" and e1<e2 and e3<e4:
-        score += 25
+        score += adaptive_weights["ema"]*100
 
-    # Momentum
     diff = np.diff(p[-5:])
     if direction=="BUY" and np.all(diff>0):
-        score += 25
+        score += adaptive_weights["momentum"]*100
     elif direction=="SELL" and np.all(diff<0):
-        score += 25
+        score += adaptive_weights["momentum"]*100
 
-    # Volatility check
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
     if std/mean < 0.005:
-        score += 25
+        score += adaptive_weights["volatility"]*100
 
-    # Pullback safety
     last_diff = np.diff(p[-OBSERVATION_TICKS:])
     if direction=="BUY" and np.all(last_diff>0):
-        score += 25
+        score += adaptive_weights["pullback"]*100
     elif direction=="SELL" and np.all(last_diff<0):
-        score += 25
+        score += adaptive_weights["pullback"]*100
 
     accuracy = min(score, max_score)
-    return max(82, min(accuracy, 85))  # Ensure between 82–85%
+    return max(82, min(accuracy, 95))
+
+# ----------------------
+# ADAPTIVE LEARNING UPDATE (AUTONOMOUS)
+# ----------------------
+def update_adaptive_weights(pair, direction, result):
+    signal_history[pair].append(result)
+    if len(signal_history[pair]) > 100:
+        signal_history[pair].pop(0)
+    success_rate = np.mean(signal_history[pair])
+    for key in adaptive_weights:
+        if result:
+            adaptive_weights[key] = min(0.4, adaptive_weights[key]+0.01)
+        else:
+            adaptive_weights[key] = max(0.15, adaptive_weights[key]-0.01)
+    logging.info(f"Adaptive weights updated: {adaptive_weights}")
 
 # ----------------------
 # TELEGRAM FUNCTIONS
@@ -138,10 +144,8 @@ def calculate_accuracy(p, direction):
 def send_asset(pair):
     msg = f"""
 SIGNAL ⚠️
-
 Asset: {pair}_otc
 Expiration: M{EXPIRY_MINUTES}
-
 Observing market for stable move...
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -152,7 +156,6 @@ def send_final(pair, direction, acc):
     arrow = "⬆️" if direction=="BUY" else "⬇️"
     msg = f"""
 SIGNAL {arrow}
-
 Asset: {pair}_otc
 Payout: 92%
 Accuracy: {acc}%
@@ -177,7 +180,7 @@ async def load_symbols():
         return []
 
 # ----------------------
-# MONITOR LOOP
+# MONITOR LOOP WITH AUTONOMOUS LEARNING
 # ----------------------
 async def monitor():
     global active_signal, cooldown_until
@@ -195,7 +198,9 @@ async def monitor():
 
             for s in symbols:
                 if s not in prices:
-                    prices[s] = []
+                    prices[s] = deque(maxlen=MAX_PRICES)
+                if s not in historical_memory:
+                    historical_memory[s] = deque(maxlen=1000)
 
             async with websockets.connect(DERIV_WS) as ws:
                 for pair in symbols:
@@ -211,25 +216,30 @@ async def monitor():
                         price = data["tick"]["quote"]
 
                         prices[pair].append(price)
-                        if len(prices[pair]) > MAX_PRICES:
-                            prices[pair].pop(0)
+                        historical_memory[pair].append(price)
 
-                        # Skip if an active signal exists
                         if active_signal:
                             continue
 
-                        direction = detect_trend(prices[pair])
+                        direction = detect_trend(list(prices[pair]))
                         if not direction:
                             continue
 
-                        if is_stable_with_no_pullback(prices[pair], direction):
-                            acc = calculate_accuracy(prices[pair], direction)
+                        if is_stable_and_no_pullback(list(prices[pair]), direction):
+                            acc = calculate_accuracy(list(prices[pair]), direction)
                             send_asset(pair)
                             send_final(pair, direction, acc)
 
+                            # Autonomous learning: check after expiry
+                            await asyncio.sleep(EXPIRY_MINUTES * 60)
+                            final_price = historical_memory[pair][-1]
+                            result = (direction=="BUY" and final_price > prices[pair][-1]) or \
+                                     (direction=="SELL" and final_price < prices[pair][-1])
+                            update_adaptive_weights(pair, direction, result)
+
                             active_signal = pair
                             cooldown_until = datetime.now(TIMEZONE) + timedelta(minutes=EXPIRY_MINUTES)
-                            prices[pair] = []  # reset for next observation
+                            prices[pair].clear()
                             break
 
                     except Exception as e_tick:
