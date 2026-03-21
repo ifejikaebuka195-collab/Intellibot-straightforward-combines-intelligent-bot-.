@@ -5,32 +5,31 @@ import websocket
 import requests
 from dotenv import load_dotenv
 
-# Load env
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Binance stream (ALL pairs)
-STREAMS = [
-    "btcusdt@trade",
-    "ethusdt@trade",
-    "bnbusdt@trade",
-    "solusdt@trade",
-    "adausdt@trade",
-    "xrpusdt@trade",
-    "dogeusdt@trade",
-    "dotusdt@trade",
-    "ltcusdt@trade",
-    "linkusdt@trade",
-    "maticusdt@trade",
-    "filusdt@trade",
-    "bchusdt@trade",
-    "trxusdt@trade",
-    "xlmusdt@trade"
-]
+WS_URL = "wss://ws.coincap.io/trades"
 
-WS_URL = "wss://stream.binance.com:9443/stream?streams=" + "/".join(STREAMS)
+# 15 crypto pairs
+TARGETS = {
+    "bitcoin",
+    "ethereum",
+    "solana",
+    "cardano",
+    "ripple",
+    "dogecoin",
+    "litecoin",
+    "chainlink",
+    "polygon",
+    "tron",
+    "stellar",
+    "monero",
+    "binancecoin",
+    "avalanche",
+    "polkadot"
+}
 
 
 def send_signal(message):
@@ -48,15 +47,12 @@ def on_message(ws, message):
     try:
         data = json.loads(message)
 
-        if "data" in data:
-            tick = data["data"]
-            symbol = tick.get("s")
-            price = tick.get("p")
+        coin = data.get("base")
+        price = data.get("priceUsd")
 
-            msg = f"{symbol} → {price}"
+        if coin and coin.lower() in TARGETS:
+            msg = f"{coin.upper()} → {price}"
             print(msg)
-
-            # SEND EVERY TICK
             send_signal(msg)
 
     except Exception as e:
@@ -74,7 +70,7 @@ def on_close(ws, close_status_code, close_msg):
 
 
 def on_open(ws):
-    print("Connected to Binance. Streaming ticks...")
+    print("Connected to CoinCap. Streaming...")
 
 
 def connect():
