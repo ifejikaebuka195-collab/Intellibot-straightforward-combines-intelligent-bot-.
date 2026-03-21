@@ -14,25 +14,22 @@ from collections import deque, defaultdict
 BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
 CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+COINCAP_WS = "wss://ws.coincap.io/prices?assets=ALL"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
 OBSERVATION_TICKS = 15
-BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
-LOSS_FREEZE_COUNT = 2
-MIN_ACCURACY = 82
-MAX_ACCURACY = 95
-MIN_SIGNALS_PER_HOUR = 2
-MIN_SIGNAL_INTERVAL = 1800  # 30 minutes per pair minimum between signals
+MIN_SIGNAL_INTERVAL = 1800  # 30 minutes min between signals
+MAX_SIGNAL_PER_HOUR = 2
+FILTER_THRESHOLD = 0.95  # 95% bad patterns filtered
 
 # ----------------------
 # GLOBAL STATE
 # ----------------------
-prices = {}
-historical_memory = {}
+prices = defaultdict(lambda: deque(maxlen=MAX_PRICES))
 signal_history = defaultdict(list)
-pair_losses = defaultdict(int)
 adaptive_weights = {"ema":0.25,"momentum":0.25,"volatility":0.25,"pullback":0.25}
+pair_losses = defaultdict(int)
 active_signals = []
 last_signal_times = defaultdict(lambda: datetime.min.replace(tzinfo=TIMEZONE))
 
@@ -42,7 +39,7 @@ last_signal_times = defaultdict(lambda: datetime.min.replace(tzinfo=TIMEZONE))
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 # ----------------------
-# EMA
+# EMA FUNCTION
 # ----------------------
 def ema(data, period):
     if len(data) < period:
@@ -68,7 +65,7 @@ def detect_trend(p):
     return None
 
 # ----------------------
-# PULLBACK & STABLE
+# PULLBACK & STABILITY
 # ----------------------
 def is_stable_and_no_pullback(p,direction):
     if len(p)<OBSERVATION_TICKS+5: return False
@@ -77,9 +74,6 @@ def is_stable_and_no_pullback(p,direction):
     if direction=="SELL": return np.all(last_diff<0)
     return False
 
-# ----------------------
-# MARKET NOISE FILTER
-# ----------------------
 def is_market_stable(p):
     if len(p)<30: return False
     std = np.std(p[-30:])
@@ -106,8 +100,7 @@ def calculate_accuracy(p,direction):
     last_diff = np.diff(p[-OBSERVATION_TICKS:])
     if direction=="BUY" and np.all(last_diff>0): score+=adaptive_weights["pullback"]*100
     if direction=="SELL" and np.all(last_diff<0): score+=adaptive_weights["pullback"]*100
-    accuracy = min(score,100)
-    return max(MIN_ACCURACY,min(accuracy,MAX_ACCURACY))
+    return min(score,100)
 
 # ----------------------
 # ADAPTIVE LEARNING
@@ -125,100 +118,108 @@ def update_adaptive_weights(pair,direction,result):
 # ----------------------
 # TELEGRAM
 # ----------------------
-def send_asset(pair):
-    msg=f"""SIGNAL ⚠️
-Asset: {pair}_otc
-Expiration: M{EXPIRY_MINUTES}
-Observing market for stable move..."""
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":msg})
-    logging.info(f"Asset observation started: {pair}")
-
-def send_final(pair,direction,acc):
+def send_signal(pair,direction,accuracy):
     arrow="⬆️" if direction=="BUY" else "⬇️"
-    msg=f"""SIGNAL {arrow}
-Asset: {pair}_otc
-Payout: 92%
-Accuracy: {acc}%
-Expiration: M{EXPIRY_MINUTES}"""
+    msg=f"SIGNAL {arrow}\nAsset: {pair}\nAccuracy: {accuracy}%\nTime: {datetime.now(TIMEZONE).strftime('%H:%M')}"
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",data={"chat_id":CHAT_ID,"text":msg})
-    logging.info(f"Final signal sent: {pair} {direction} Accuracy: {acc}%")
+    logging.info(f"Sent signal for {pair} direction {direction} accuracy {accuracy}")
 
 # ----------------------
-# LOAD SYMBOLS
+# DERIV LOAD SYMBOLS
 # ----------------------
-async def load_symbols():
+async def load_deriv_symbols():
     try:
         async with websockets.connect(DERIV_WS) as ws:
             await ws.send(json.dumps({"active_symbols":"brief"}))
             res = json.loads(await ws.recv())
-            return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx") and s["symbol"] not in BLOCKED_PAIRS]
-    except Exception as e:
-        logging.warning(f"Failed to load symbols: {e}")
+            return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx")]
+    except:
         return []
 
 # ----------------------
-# ELITE MONITOR LOOP
+# RANKING FUNCTION (Top 2 Pairs)
+# ----------------------
+def rank_top_pairs():
+    scores = {}
+    for pair, pdeque in prices.items():
+        if len(pdeque)<50: continue
+        direction = detect_trend(list(pdeque))
+        if not direction: continue
+        if not is_stable_and_no_pullback(list(pdeque),direction): continue
+        if not is_market_stable(list(pdeque)): continue
+        scores[pair] = calculate_accuracy(list(pdeque),direction)
+    # Sort by score descending
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return ranked[:2]  # top 2 pairs
+
+# ----------------------
+# MONITOR LOOP
 # ----------------------
 async def monitor():
     global active_signals,last_signal_times
 
     while True:
         try:
-            symbols = await load_symbols()
-            if not symbols: await asyncio.sleep(5); continue
+            deriv_symbols = await load_deriv_symbols()
+            if not deriv_symbols:
+                await asyncio.sleep(5)
+                continue
 
-            for s in symbols:
+            for s in deriv_symbols:
                 if s not in prices: prices[s]=deque(maxlen=MAX_PRICES)
-                if s not in historical_memory: historical_memory[s]=deque(maxlen=1000)
 
-            async with websockets.connect(DERIV_WS) as ws:
-                for pair in symbols: await ws.send(json.dumps({"ticks":pair,"subscribe":1}))
+            async with websockets.connect(DERIV_WS) as deriv_ws, websockets.connect(COINCAP_WS) as coin_ws:
+                for pair in deriv_symbols:
+                    await deriv_ws.send(json.dumps({"ticks":pair,"subscribe":1}))
 
-                async for msg in ws:
-                    try:
-                        data=json.loads(msg)
-                        if "tick" not in data: continue
+                async def handle_deriv():
+                    async for msg in deriv_ws:
+                        try:
+                            data=json.loads(msg)
+                            if "tick" not in data: continue
+                            pair = data["tick"]["symbol"]
+                            price = data["tick"]["quote"]
+                            prices[pair].append(price)
+                        except Exception as e:
+                            logging.error(f"Deriv tick error: {e}")
 
-                        pair=data["tick"]["symbol"]
-                        price=data["tick"]["quote"]
+                async def handle_coin():
+                    async for msg in coin_ws:
+                        try:
+                            data = json.loads(msg)
+                            for pair,price in data.items():
+                                prices[pair].append(price)
+                        except Exception as e:
+                            logging.error(f"CoinCap tick error: {e}")
 
-                        if pair_losses[pair]>=LOSS_FREEZE_COUNT: continue
-                        prices[pair].append(price)
-                        historical_memory[pair].append(price)
-                        now=datetime.now(TIMEZONE)
+                async def signal_loop():
+                    while True:
+                        top_pairs = rank_top_pairs()
+                        for pair,score in top_pairs:
+                            now = datetime.now(TIMEZONE)
+                            if (now - last_signal_times[pair]).total_seconds() < MIN_SIGNAL_INTERVAL:
+                                continue
+                            if len(active_signals)>=MAX_SIGNAL_PER_HOUR: break
+                            direction = detect_trend(list(prices[pair]))
+                            if not direction: continue
+                            send_signal(pair,direction,score)
+                            last_signal_times[pair] = now
+                            active_signals.append(pair)
+                            await asyncio.sleep(EXPIRY_MINUTES*60)
+                            final_price = prices[pair][-1]
+                            result = (direction=="BUY" and final_price>prices[pair][0]) or (direction=="SELL" and final_price<prices[pair][0])
+                            update_adaptive_weights(pair,direction,result)
+                            active_signals.remove(pair)
+                            prices[pair].clear()
+                        await asyncio.sleep(10)
 
-                        # Ensure 2+ signals per hour
-                        seconds_since_last = (now-last_signal_times[pair]).total_seconds()
-                        if seconds_since_last<MIN_SIGNAL_INTERVAL: continue
-
-                        direction=detect_trend(list(prices[pair]))
-                        if not direction: continue
-                        if not is_stable_and_no_pullback(list(prices[pair]),direction): continue
-                        if not is_market_stable(list(prices[pair])): continue
-
-                        acc=calculate_accuracy(list(prices[pair]),direction)
-                        send_asset(pair)
-                        send_final(pair,direction,acc)
-
-                        last_signal_times[pair]=now
-                        active_signals.append(pair)
-
-                        await asyncio.sleep(EXPIRY_MINUTES*60)
-                        final_price=historical_memory[pair][-1]
-                        result=(direction=="BUY" and final_price>prices[pair][-1]) or (direction=="SELL" and final_price<prices[pair][-1])
-                        update_adaptive_weights(pair,direction,result)
-
-                        active_signals.remove(pair)
-                        prices[pair].clear()
-
-                    except Exception as e_tick:
-                        logging.error(f"Tick error: {e_tick}")
+                await asyncio.gather(handle_deriv(), handle_coin(), signal_loop())
 
         except Exception as e_outer:
             logging.error(f"Main loop error: {e_outer}")
             await asyncio.sleep(5)
 
 # ----------------------
-# RUN
+# RUN SYSTEM
 # ----------------------
 asyncio.run(monitor())
