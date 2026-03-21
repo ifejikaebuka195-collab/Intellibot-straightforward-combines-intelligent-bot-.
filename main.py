@@ -1,37 +1,28 @@
-import os
 import json
 import time
-import requests
 import websocket
-import threading
-from dotenv import load_dotenv
+import requests
 
-# Load environment variables
-load_dotenv()
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SYMBOLS = os.getenv("SYMBOLS", "").split(",")
+# ⚠️ Your Telegram bot token and chat ID (directly in the script)
+BOT_TOKEN = "8751531182:AAHRVd3Zeo7Z9wUWb9q7ruiH_lppQE_ymak"
+CHAT_ID = "8308393231"
 
-# Send messages to Telegram
-def send_telegram(msg):
+def send_signal(message):
+    """Send a message to your Telegram bot safely."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+        requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=5)
     except Exception as e:
         print("Telegram send error:", e)
 
-# Handle incoming ticks
 def on_message(ws, message):
+    """Triggered on every tick from WebSocket."""
     try:
         data = json.loads(message)
-        symbol = data.get("symbol")
-        price = data.get("last")
-        if symbol and symbol in SYMBOLS:
-            text = f"{symbol} → {price}"
-            print(text)
-            send_telegram(text)
+        # Every tick sends a signal
+        send_signal(f"Tick received: {json.dumps(data)}")
     except Exception as e:
-        print("Tick parse error:", e)
+        print("Error parsing tick:", e)
 
 def on_error(ws, error):
     print("WebSocket error:", error)
@@ -39,26 +30,21 @@ def on_error(ws, error):
 def on_close(ws, close_status_code, close_msg):
     print("WebSocket closed, reconnecting in 5 seconds...")
     time.sleep(5)
-    start_ws()  # Auto-reconnect
+    connect_ws()  # Reconnect automatically
 
 def on_open(ws):
-    print("WebSocket connected")
-    # Subscribe to symbols
-    for sym in SYMBOLS:
-        ws.send(json.dumps({"action":"Subscribe","symbol": sym}))
+    print("WebSocket connected. Listening for all ticks...")
 
-# Start WebSocket connection
-def start_ws():
-    wsapp = websocket.WebSocketApp(
-        "wss://ws.biquote.io/",
+def connect_ws():
+    """Connects to Pocket Option public demo WebSocket."""
+    ws = websocket.WebSocketApp(
+        "wss://ws.pocketoption.com/socket.io/?EIO=4&transport=websocket",
         on_open=on_open,
         on_message=on_message,
         on_error=on_error,
         on_close=on_close
     )
-    wsapp.run_forever()
+    ws.run_forever()
 
 if __name__ == "__main__":
-    threading.Thread(target=start_ws).start()
-    while True:
-        time.sleep(1)
+    connect_ws()
