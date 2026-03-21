@@ -1,5 +1,3 @@
-websocket-client
-websockets
-requests
-numpy
-pytz
+websocket-client==1.6.2
+requests==2.32.0
+python-dotenv==1.0.0
