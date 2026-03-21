@@ -14,7 +14,6 @@ import logging
 BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
 CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
-COINCAP_WS = "wss://ws.coincap.io/prices?assets=ALL"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
 EXPIRY_MINUTES = 5
@@ -27,8 +26,8 @@ MIN_SIGNAL_INTERVAL = 1800  # 30 minutes between signals
 
 # Weekend crypto pairs to stream automatically
 CRYPTO_PAIRS = ["bitcoin", "ethereum", "litecoin", "cardano", "dogecoin",
-                "ripple","polkadot","binance-coin","stellar","chainlink",
-                "uniswap","vechain","tron","monero","tezos"]
+"ripple","polkadot","binance-coin","stellar","chainlink",
+"uniswap","vechain","tron","monero","tezos"]
 
 # ----------------------
 # GLOBAL STATE
@@ -157,66 +156,66 @@ async def get_deriv_symbols():
 async def system_loop():
     global last_signal_times, active_signals
 
-    while True:
-        now = datetime.now(TIMEZONE)
-        weekday = now.weekday()
-        hour = now.hour
+    while True:    
+        now = datetime.now(TIMEZONE)    
+        weekday = now.weekday()    
+        hour = now.hour    
 
-        # Determine source: Deriv Mon-Fri, CoinCap Fri 21:00 - Sun 00:00
-        use_deriv = True
-        if (weekday == 4 and hour >= 21) or weekday == 5 or weekday == 6:
-            use_deriv = False
+        # Determine source: Deriv Mon-Fri, crypto weekend switch
+        use_deriv = True    
+        if (weekday == 4 and hour >= 21) or weekday == 5 or weekday == 6:    
+            use_deriv = False    
 
-        symbols = await get_deriv_symbols() if use_deriv else CRYPTO_PAIRS
+        symbols = await get_deriv_symbols() if use_deriv else CRYPTO_PAIRS    
 
-        for s in symbols:
-            if s not in prices: prices[s] = deque(maxlen=MAX_PRICES)
-            if s not in historical_memory: historical_memory[s] = deque(maxlen=MAX_PRICES)
+        for s in symbols:    
+            if s not in prices: prices[s] = deque(maxlen=MAX_PRICES)    
+            if s not in historical_memory: historical_memory[s] = deque(maxlen=MAX_PRICES)    
 
-        ws_url = DERIV_WS if use_deriv else COINCAP_WS
+        ws_url = DERIV_WS  # Only Deriv now (CoinCap removed)
 
-        try:
-            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
-                # Subscribe ticks
-                if use_deriv:
-                    for s in symbols:
-                        await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
+        try:    
+            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:    
+                # Subscribe ticks    
+                if use_deriv:    
+                    for s in symbols:    
+                        await ws.send(json.dumps({"ticks": s, "subscribe": 1}))    
 
-                async for msg in ws:
-                    try:
-                        data = json.loads(msg)
-                        if use_deriv and "tick" in data:
-                            pair = data["tick"]["symbol"]
-                            price = data["tick"]["quote"]
-                        elif not use_deriv:
-                            pair = list(data.keys())[0]
-                            price = float(data[pair])
-                        else:
-                            continue
+                async for msg in ws:    
+                    try:    
+                        data = json.loads(msg)    
+                        if use_deriv and "tick" in data:    
+                            pair = data["tick"]["symbol"]    
+                            price = data["tick"]["quote"]    
+                        elif not use_deriv:    
+                            pair = list(data.keys())[0]    
+                            price = float(data[pair])    
+                        else:    
+                            continue    
 
-                        prices[pair].append(price)
-                        historical_memory[pair].append(price)
+                        prices[pair].append(price)    
+                        historical_memory[pair].append(price)    
 
-                        seconds_since_last = (now - last_signal_times[pair]).total_seconds()
-                        if seconds_since_last < MIN_SIGNAL_INTERVAL: continue
+                        seconds_since_last = (now - last_signal_times[pair]).total_seconds()    
+                        if seconds_since_last < MIN_SIGNAL_INTERVAL: continue    
 
-                        direction = detect_trend(prices[pair])
-                        if not direction: continue
-                        if not is_stable(prices[pair], direction): continue
-                        if not is_market_stable(prices[pair]): continue
+                        direction = detect_trend(prices[pair])    
+                        if not direction: continue    
+                        if not is_stable(prices[pair], direction): continue    
+                        if not is_market_stable(prices[pair]): continue    
 
-                        accuracy = calculate_accuracy(prices[pair], direction)
-                        trend_type = "Stable Trend" if np.std(list(prices[pair])[-5:]) < 0.005 else "Massive Breakout"
-                        send_signal(pair, direction, accuracy, trend_type)
-                        last_signal_times[pair] = now
+                        accuracy = calculate_accuracy(prices[pair], direction)    
+                        trend_type = "Stable Trend" if np.std(list(prices[pair])[-5:]) < 0.005 else "Massive Breakout"    
+                        send_signal(pair, direction, accuracy, trend_type)    
+                        last_signal_times[pair] = now    
 
-                        await asyncio.sleep(EXPIRY_MINUTES * 60)
+                        await asyncio.sleep(EXPIRY_MINUTES * 60)    
 
-                    except Exception as e_tick:
-                        logging.error(f"Tick processing error: {e_tick}")
+                    except Exception as e_tick:    
+                        logging.error(f"Tick processing error: {e_tick}")    
 
-        except Exception as e_outer:
-            logging.error(f"Main loop connection error: {e_outer}")
+        except Exception as e_outer:    
+            logging.error(f"Main loop connection error: {e_outer}")    
             await asyncio.sleep(5)
 
 # ----------------------
