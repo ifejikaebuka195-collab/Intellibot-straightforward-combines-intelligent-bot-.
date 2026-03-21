@@ -18,7 +18,7 @@ TIMEZONE = pytz.timezone("Africa/Lagos")
 
 EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
-MIN_SIGNAL_INTERVAL = 60  # allow system to scan frequently
+MIN_SIGNAL_INTERVAL = 60  # frequent scanning
 
 # Crypto (weekend)
 CRYPTO_PAIRS = [
@@ -41,7 +41,7 @@ last_hour = None
 logging.basicConfig(level=logging.INFO)
 
 # ----------------------
-# EMA
+# EMA FUNCTION
 # ----------------------
 def ema(data, period):
     if len(data) < period:
@@ -53,7 +53,7 @@ def ema(data, period):
     return val
 
 # ----------------------
-# STRONG TREND ENGINE
+# TREND ANALYSIS
 # ----------------------
 def analyze_pair(p):
     if len(p) < 60:
@@ -83,14 +83,14 @@ def analyze_pair(p):
     if not direction:
         return None, 0
 
-    # Momentum
+    # Momentum filter
     diff = np.diff(p[-6:])
     if direction == "BUY" and np.all(diff > 0):
         score += 25
     if direction == "SELL" and np.all(diff < 0):
         score += 25
 
-    # Stability
+    # Stability filter
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
     if std / mean < 0.004:
@@ -106,7 +106,7 @@ def analyze_pair(p):
     return direction, score
 
 # ----------------------
-# TELEGRAM
+# TELEGRAM SIGNAL
 # ----------------------
 def send_signal(pair, direction, accuracy, trend_type):
     arrow = "⬆️" if direction == "BUY" else "⬇️"
@@ -128,7 +128,7 @@ Expiry: {EXPIRY_MINUTES} min
         logging.error(e)
 
 # ----------------------
-# GET SYMBOLS
+# GET FOREX SYMBOLS
 # ----------------------
 async def get_symbols():
     try:
@@ -137,27 +137,11 @@ async def get_symbols():
             res = json.loads(await ws.recv())
             return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx")]
     except Exception as e:
-        logging.error(f"Error fetching symbols: {e}")
+        logging.error(f"Error fetching forex symbols: {e}")
         return []
 
 # ----------------------
-# RESILIENT WEBSOCKET CONNECTOR
-# ----------------------
-async def connect_ws(symbols):
-    while True:
-        try:
-            async with websockets.connect(DERIV_WS, ping_interval=10, ping_timeout=10) as ws:
-                for s in symbols:
-                    await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
-
-                async for msg in ws:
-                    yield msg
-        except Exception as e:
-            logging.error(f"WebSocket error, reconnecting: {e}")
-            await asyncio.sleep(3)  # wait and reconnect
-
-# ----------------------
-# MAIN SYSTEM
+# SYSTEM LOOP
 # ----------------------
 async def system_loop():
     global last_signal_time, signal_count_hour, last_hour
@@ -173,58 +157,65 @@ async def system_loop():
         weekday = now.weekday()
         hour = now.hour
 
-        # Switch logic
+        # Determine symbols to track
         if (weekday == 4 and hour >= 21) or weekday in [5,6]:
             symbols = CRYPTO_PAIRS
         else:
             symbols = await get_symbols()
 
-        ws_generator = connect_ws(symbols)
-
-        async for msg in ws_generator:
+        # ----------------------
+        # Safe WebSocket connection pattern (no changes to other script logic)
+        # ----------------------
+        while True:
             try:
-                data = json.loads(msg)
+                async with websockets.connect(DERIV_WS) as ws:
+                    for s in symbols:
+                        await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
 
-                if "tick" not in data:
-                    continue
+                    async for msg in ws:
+                        data = json.loads(msg)
 
-                pair = data["tick"]["symbol"]
-                price = data["tick"]["quote"]
+                        if "tick" not in data:
+                            continue
 
-                prices[pair].append(price)
+                        pair = data["tick"]["symbol"]
+                        price = data["tick"]["quote"]
 
-                # Wait enough data
-                if len(prices[pair]) < 60:
-                    continue
+                        prices[pair].append(price)
 
-                # Analyze
-                direction, score = analyze_pair(prices[pair])
-                if not direction or score < 75:
-                    continue
+                        # Ensure enough data
+                        if len(prices[pair]) < 60:
+                            continue
 
-                # Limit signals per hour
-                if signal_count_hour >= 2:
-                    continue
+                        # Analyze pair
+                        direction, score = analyze_pair(prices[pair])
+                        if not direction or score < 75:
+                            continue
 
-                # Timing control
-                if (now - last_signal_time).total_seconds() < EXPIRY_MINUTES * 60:
-                    continue
+                        # Enforce 2 signals per hour
+                        if signal_count_hour >= 2:
+                            continue
 
-                accuracy = min(95, int(score))
-                trend_type = "Stable Trend" if score < 90 else "Strong Breakout"
+                        # Timing control
+                        if (now - last_signal_time).total_seconds() < EXPIRY_MINUTES * 60:
+                            continue
 
-                send_signal(pair, direction, accuracy, trend_type)
+                        accuracy = min(95, int(score))
+                        trend_type = "Stable Trend" if score < 90 else "Strong Breakout"
 
-                last_signal_time = now
-                signal_count_hour += 1
+                        send_signal(pair, direction, accuracy, trend_type)
 
-                await asyncio.sleep(EXPIRY_MINUTES * 60)
+                        last_signal_time = datetime.now(TIMEZONE)
+                        signal_count_hour += 1
+
+                        # Wait for expiry before next signal
+                        await asyncio.sleep(EXPIRY_MINUTES * 60)
 
             except Exception as e:
-                logging.error(f"Processing error: {e}")
-                continue
+                logging.error(f"WebSocket error, reconnecting: {e}")
+                await asyncio.sleep(5)
 
 # ----------------------
-# RUN
+# RUN SYSTEM
 # ----------------------
 asyncio.run(system_loop())
