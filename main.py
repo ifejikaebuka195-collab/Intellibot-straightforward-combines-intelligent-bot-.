@@ -6,13 +6,13 @@ import websocket
 import threading
 from dotenv import load_dotenv
 
-# Load environment
+# Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOLS = os.getenv("SYMBOLS", "").split(",")
 
-# Send to Telegram
+# Send messages to Telegram
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
@@ -20,7 +20,7 @@ def send_telegram(msg):
     except Exception as e:
         print("Telegram send error:", e)
 
-# Handler for each tick
+# Handle incoming ticks
 def on_message(ws, message):
     try:
         data = json.loads(message)
@@ -34,18 +34,20 @@ def on_message(ws, message):
         print("Tick parse error:", e)
 
 def on_error(ws, error):
-    print("WS error:", error)
+    print("WebSocket error:", error)
 
 def on_close(ws, close_status_code, close_msg):
-    print("WS closed")
+    print("WebSocket closed, reconnecting in 5 seconds...")
+    time.sleep(5)
+    start_ws()  # Auto-reconnect
 
 def on_open(ws):
-    print("WS connected")
-    # Subscribe to your symbols
+    print("WebSocket connected")
+    # Subscribe to symbols
     for sym in SYMBOLS:
         ws.send(json.dumps({"action":"Subscribe","symbol": sym}))
 
-# Start WebSocket
+# Start WebSocket connection
 def start_ws():
     wsapp = websocket.WebSocketApp(
         "wss://ws.biquote.io/",
