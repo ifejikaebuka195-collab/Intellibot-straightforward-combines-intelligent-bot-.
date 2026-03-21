@@ -15,7 +15,7 @@ import time
 BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
 CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
-WEEKEND_WS = "wss://biquote.io/hubs/tick"  # Real weekend free feed
+WEEKEND_WS = "wss://biquote.io/hubs/tick"  # Real weekend feed
 TIMEZONE = pytz.timezone("Africa/Lagos")
 EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
@@ -42,7 +42,6 @@ active_pair = None
 last_signal_time = datetime.min.replace(tzinfo=TIMEZONE)
 signals_sent_this_hour = 0
 current_hour = datetime.now(TIMEZONE).hour
-pending_signal = None  # Holds the second signal if available
 
 # ----------------------
 # LOGGING
@@ -156,7 +155,7 @@ async def load_symbols(ws_url):
                 await ws.send(json.dumps({"active_symbols":"brief"}))
                 res = json.loads(await ws.recv())
                 return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx") and s["symbol"] not in BLOCKED_PAIRS]
-            else:  # BiQuote format
+            else:
                 await ws.send(json.dumps({"type":"subscribe","pairs":["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCHF"]}))
                 return ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCHF"]
     except Exception as e:
@@ -164,10 +163,10 @@ async def load_symbols(ws_url):
         return []
 
 # ----------------------
-# MONITOR PAIRS WITH GUARANTEED 2 SIGNALS PER HOUR
+# MONITOR PAIRS WITH GUARANTEED TWO SIGNALS PER HOUR
 # ----------------------
 async def monitor_pairs(symbols):
-    global active_pair, last_signal_time, signals_sent_this_hour, current_hour, pending_signal
+    global active_pair, last_signal_time, signals_sent_this_hour, current_hour
     for pair in symbols:
         prices[pair] = deque(maxlen=MAX_PRICES)
         historical_memory[pair] = deque(maxlen=MAX_PRICES)
@@ -198,17 +197,16 @@ async def monitor_pairs(symbols):
                 await asyncio.sleep(5)
 
     async def ranking_loop():
-        global active_pair, last_signal_time, signals_sent_this_hour, current_hour, pending_signal
+        global active_pair, last_signal_time, signals_sent_this_hour, current_hour
         while True:
             now = datetime.now(TIMEZONE)
             ws_url = WEEKEND_WS if (now.weekday() == 4 and now.hour >= 22) or now.weekday() in [5,6] else DERIV_WS
             if now.hour != current_hour:
                 signals_sent_this_hour = 0
-                pending_signal = None
                 current_hour = now.hour
 
-            # Only allow 2 signals per hour, manage first and second
-            if signals_sent_this_hour < MAX_SIGNALS_PER_HOUR and not active_pair:
+            # Guaranteed two signals per hour logic
+            while signals_sent_this_hour < MAX_SIGNALS_PER_HOUR:
                 candidates = []
                 for pair in symbols:
                     if len(prices[pair])<50: continue
@@ -219,38 +217,28 @@ async def monitor_pairs(symbols):
                     acc = calculate_accuracy(list(prices[pair]),direction)
                     if acc>=MIN_ACCURACY:
                         candidates.append((acc,pair,direction))
-                if candidates:
-                    candidates.sort(reverse=True)
-                    acc,pair,direction = candidates[0]
-                    move_type = "Big Move" if detect_explosion(list(prices[pair]),direction) else "Steady Trend"
-                    if pending_signal is None:
-                        # First signal of the hour
-                        active_pair = pair
-                        signals_sent_this_hour +=1
-                        last_signal_time = datetime.now(TIMEZONE)
-                        send_asset(pair, move_type)
-                        await asyncio.sleep(2)
-                        send_final(pair,direction,acc,move_type)
-                        await asyncio.sleep(EXPIRY_MINUTES*60)
-                        final_price = historical_memory[pair][-1]
-                        result = (direction=="BUY" and final_price>prices[pair][-1]) or (direction=="SELL" and final_price<prices[pair][-1])
-                        update_adaptive_weights(pair,direction,result)
-                        active_pair = None
-                        pending_signal = True  # mark ready for second signal
-                    elif pending_signal:
-                        # Second signal of the hour
-                        active_pair = pair
-                        signals_sent_this_hour +=1
-                        last_signal_time = datetime.now(TIMEZONE)
-                        send_asset(pair, move_type)
-                        await asyncio.sleep(2)
-                        send_final(pair,direction,acc,move_type)
-                        await asyncio.sleep(EXPIRY_MINUTES*60)
-                        final_price = historical_memory[pair][-1]
-                        result = (direction=="BUY" and final_price>prices[pair][-1]) or (direction=="SELL" and final_price<prices[pair][-1])
-                        update_adaptive_weights(pair,direction,result)
-                        active_pair = None
-                        pending_signal = None  # reset for next hour
+                if not candidates:
+                    # If no perfect candidates, pick the best available for must-drop
+                    for pair in symbols:
+                        if len(prices[pair])<50: continue
+                        direction = detect_trend(list(prices[pair])) or "BUY"
+                        acc = calculate_accuracy(list(prices[pair]),direction)
+                        candidates.append((acc,pair,direction))
+                candidates.sort(reverse=True)
+                acc,pair,direction = candidates[0]
+                move_type = "Big Move" if detect_explosion(list(prices[pair]),direction) else "Steady Trend"
+                active_pair = pair
+                signals_sent_this_hour +=1
+                last_signal_time = datetime.now(TIMEZONE)
+                send_asset(pair, move_type)
+                await asyncio.sleep(2)
+                send_final(pair,direction,acc,move_type)
+                await asyncio.sleep(EXPIRY_MINUTES*60)
+                final_price = historical_memory[pair][-1]
+                result = (direction=="BUY" and final_price>prices[pair][-1]) or (direction=="SELL" and final_price<prices[pair][-1])
+                update_adaptive_weights(pair,direction,result)
+                active_pair = None
+
             await asyncio.sleep(1)
 
     tasks = [handle_single(pair, WEEKEND_WS if datetime.now(TIMEZONE).weekday() in [5,6] else DERIV_WS) for pair in symbols] + [ranking_loop()]
