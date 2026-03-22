@@ -32,7 +32,7 @@ CRYPTO_PAIRS = [
 # ----------------------
 prices = defaultdict(lambda: deque(maxlen=MAX_PRICES))
 tick_confirm = defaultdict(lambda: {"dir": None, "count": 0})
-active_signal_lock = None  # Global lock: only 1 signal active at a time
+lock_until = None
 
 logging.basicConfig(level=logging.INFO)
 
@@ -49,14 +49,13 @@ def ema(data, period):
     return val
 
 # ----------------------
-# PRO ANALYSIS ENGINE
+# ANALYSIS ENGINE
 # ----------------------
 def analyze_pair(p):
     if len(p) < 60:
         return None, None, None
 
     p = list(p)
-
     e1 = ema(p[-10:], 3)
     e2 = ema(p[-20:], 5)
     e3 = ema(p[-30:], 8)
@@ -145,38 +144,34 @@ Expiry: {EXPIRY_MINUTES} min
 # MAIN LOOP
 # ----------------------
 async def main():
-    global active_signal_lock
+    global lock_until, tick_confirm
 
     while True:
         try:
             async with websockets.connect(DERIV_WS) as ws:
 
-                # Subscribe to crypto pairs directly
+                # Subscribe to crypto pairs
                 for s in CRYPTO_PAIRS:
                     await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
 
                 async for msg in ws:
                     data = json.loads(msg)
-
                     if "tick" not in data:
                         continue
 
                     pair = data["tick"]["symbol"]
                     price = data["tick"]["quote"]
-
                     prices[pair].append(price)
 
-                    # If a signal is active, wait until it expires
-                    if active_signal_lock and datetime.now(TIMEZONE) < active_signal_lock:
+                    # Only allow one active signal
+                    if lock_until and datetime.now(TIMEZONE) < lock_until:
                         continue
 
                     direction, acc, trend = analyze_pair(prices[pair])
-
                     if not direction:
                         tick_confirm[pair] = {"dir": None, "count": 0}
                         continue
 
-                    # Tick confirmation (3 consecutive ticks)
                     if tick_confirm[pair]["dir"] == direction:
                         tick_confirm[pair]["count"] += 1
                     else:
@@ -185,22 +180,15 @@ async def main():
                     if tick_confirm[pair]["count"] < 3:
                         continue
 
-                    # ✅ Delay for entry time
+                    # Wait for ENTRY_DELAY seconds before sending signal
                     await asyncio.sleep(ENTRY_DELAY)
-
-                    # Send the signal
                     send_signal(pair, direction, acc, trend)
 
-                    # Lock the system until this signal expires
-                    active_signal_lock = datetime.now(TIMEZONE) + timedelta(minutes=EXPIRY_MINUTES)
-
-                    # Wait until expiry before scanning for new signals
-                    await asyncio.sleep(EXPIRY_MINUTES * 60)
+                    # Lock scanning until current signal expires
+                    lock_until = datetime.now(TIMEZONE) + timedelta(minutes=EXPIRY_MINUTES)
 
                     # Reset tick confirmations after expiry
-                    tick_confirm = defaultdict(lambda: {"dir": None, "count": 0})
-                    active_signal_lock = None
-                    prices[pair].clear()  # optional: clear this pair's history after signal
+                    tick_confirm.clear()
 
         except Exception as e:
             logging.error(f"Reconnect: {e}")
