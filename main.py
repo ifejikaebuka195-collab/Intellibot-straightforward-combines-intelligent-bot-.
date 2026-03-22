@@ -20,6 +20,13 @@ EXPIRY_MINUTES = 5
 ENTRY_DELAY = 2
 MAX_PRICES = 5000
 
+# ✅ 15 CRYPTO PAIRS (DERIV OTC)
+CRYPTO_PAIRS = [
+    "cryBTCUSD","cryETHUSD","cryLTCUSD","cryXRPUSD","cryBCHUSD",
+    "cryEOSUSD","cryTRXUSD","cryADAUSD","cryBNBUSD","cryDOTUSD",
+    "cryLINKUSD","cryXLMUSD","cryDOGEUSD","cryUNIUSD","crySOLUSD"
+]
+
 # ----------------------
 # STATE
 # ----------------------
@@ -61,7 +68,6 @@ def analyze_pair(p):
     direction = None
     score = 0
 
-    # STRONG TREND STRUCTURE
     if e1 > e2 > e3 > e4:
         direction = "BUY"
         score += 30
@@ -72,39 +78,34 @@ def analyze_pair(p):
     if not direction:
         return None, None, None
 
-    # MOMENTUM (STRICT)
     diff = np.diff(p[-10:])
     if direction == "BUY" and np.sum(diff > 0) >= 8:
         score += 25
     elif direction == "SELL" and np.sum(diff < 0) >= 8:
         score += 25
     else:
-        return None, None, None  # ❌ reject weak momentum
+        return None, None, None
 
-    # CLEAN TREND (LOW NOISE)
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
     if std / mean < 0.004:
         score += 20
     else:
-        return None, None, None  # ❌ reject noisy market
+        return None, None, None
 
-    # BREAKOUT / BIG MOVE
     move = abs(p[-1] - p[-15])
     noise = np.std(p[-15:])
     if move > noise * 2:
         score += 20
 
-    # FINAL PUSH (ENTRY TIMING)
     last = np.diff(p[-3:])
     if direction == "BUY" and np.all(last > 0):
         score += 15
     elif direction == "SELL" and np.all(last < 0):
         score += 15
     else:
-        return None, None, None  # ❌ reject weak entry timing
+        return None, None, None
 
-    # ACCURACY (REALISTIC MAPPING)
     if score >= 90:
         return direction, 95, "EXPLOSIVE MOVE"
     elif score >= 80:
@@ -141,18 +142,6 @@ Expiry: {EXPIRY_MINUTES} min
         logging.error(e)
 
 # ----------------------
-# LOAD SYMBOLS
-# ----------------------
-async def get_symbols():
-    try:
-        async with websockets.connect(DERIV_WS) as ws:
-            await ws.send(json.dumps({"active_symbols": "brief"}))
-            res = json.loads(await ws.recv())
-            return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx")]
-    except:
-        return []
-
-# ----------------------
 # MAIN LOOP
 # ----------------------
 async def main():
@@ -160,13 +149,10 @@ async def main():
 
     while True:
         try:
-            symbols = await get_symbols()
-            if not symbols:
-                await asyncio.sleep(5)
-                continue
-
             async with websockets.connect(DERIV_WS) as ws:
-                for s in symbols:
+
+                # ✅ Subscribe to crypto pairs directly
+                for s in CRYPTO_PAIRS:
                     await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
 
                 async for msg in ws:
@@ -180,7 +166,6 @@ async def main():
 
                     prices[pair].append(price)
 
-                    # WAIT IF LOCKED
                     if lock_until and datetime.now(TIMEZONE) < lock_until:
                         continue
 
@@ -190,7 +175,6 @@ async def main():
                         tick_confirm[pair] = {"dir": None, "count": 0}
                         continue
 
-                    # TICK CONFIRMATION (NO EARLY ENTRY)
                     if tick_confirm[pair]["dir"] == direction:
                         tick_confirm[pair]["count"] += 1
                     else:
@@ -199,12 +183,10 @@ async def main():
                     if tick_confirm[pair]["count"] < 3:
                         continue
 
-                    # PERFECT TIMING DELAY
                     await asyncio.sleep(2)
 
                     send_signal(pair, direction, acc, trend)
 
-                    # LOCK SYSTEM (WAIT FOR EXPIRY)
                     lock_until = datetime.now(TIMEZONE) + timedelta(
                         minutes=ENTRY_DELAY + EXPIRY_MINUTES
                     )
