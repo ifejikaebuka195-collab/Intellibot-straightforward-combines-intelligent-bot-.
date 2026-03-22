@@ -2,7 +2,7 @@ import asyncio
 import json
 import requests
 import websockets
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque, defaultdict
 import pytz
 import numpy as np
@@ -19,6 +19,7 @@ TIMEZONE = pytz.timezone("Africa/Lagos")
 EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
 MIN_SIGNAL_INTERVAL = 60  # frequent scanning
+TICK_CONFIRMATION = 3
 
 # Crypto (weekend)
 CRYPTO_PAIRS = [
@@ -31,11 +32,13 @@ CRYPTO_PAIRS = [
 # GLOBAL STATE
 # ----------------------
 prices = defaultdict(lambda: deque(maxlen=MAX_PRICES))
+tick_confirm = defaultdict(lambda: {"count": 0, "dir": None})
 last_signal_time = datetime.min.replace(tzinfo=TIMEZONE)
 signal_count_hour = 0
 last_hour = None
 pending_signal = None
 signal_ready = False
+global_lock = None
 
 # ----------------------
 # LOGGING
@@ -127,7 +130,19 @@ Expiry: {EXPIRY_MINUTES} min
         )
         logging.info(f"SENT: {pair} {direction} {accuracy}%")
     except Exception as e:
-        logging.error(e)
+        logging.error(f"Telegram error: {e}")
+
+# ----------------------
+# LOCK
+# ----------------------
+def locked():
+    global global_lock
+    return global_lock and datetime.now(TIMEZONE) < global_lock
+
+def set_lock():
+    global global_lock
+    total = EXPIRY_MINUTES
+    global_lock = datetime.now(TIMEZONE) + timedelta(minutes=total)
 
 # ----------------------
 # GET FOREX SYMBOLS
@@ -143,7 +158,7 @@ async def get_symbols():
         return []
 
 # ----------------------
-# SYSTEM LOOP
+# SYSTEM LOOP WITH ROBUST WEBSOCKET
 # ----------------------
 async def system_loop():
     global last_signal_time, signal_count_hour, last_hour, pending_signal, signal_ready
@@ -160,12 +175,8 @@ async def system_loop():
         hour = now.hour
 
         # Determine symbols to track
-        if (weekday == 4 and hour >= 21) or weekday in [5,6]:
-            symbols = CRYPTO_PAIRS
-        else:
-            symbols = await get_symbols()
+        symbols = CRYPTO_PAIRS if (weekday == 4 and hour >= 21) or weekday in [5,6] else await get_symbols()
 
-        # Safe WebSocket connection loop
         while True:
             try:
                 async with websockets.connect(DERIV_WS) as ws:
@@ -174,59 +185,73 @@ async def system_loop():
                         await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
 
                     async for msg in ws:
-                        data = json.loads(msg)
-
-                        if "tick" not in data:
-                            continue
-
-                        pair = data["tick"]["symbol"]
-                        price = data["tick"]["quote"]
-                        prices[pair].append(price)
-
-                        if len(prices[pair]) < 60:
-                            continue
-
-                        # Analyze trend
-                        direction, score = analyze_pair(prices[pair])
-                        if not direction or score < 75:
-                            pending_signal = None
-                            signal_ready = False
-                            continue
-
-                        # Trend stabilization: require consecutive tick alignment
-                        if pending_signal and pending_signal[0] == pair and pending_signal[1] == direction:
-                            signal_ready = True
-                        else:
-                            pending_signal = (pair, direction, score)
-                            signal_ready = False
-
-                        # Send signal only when ready
-                        if signal_ready:
-                            # Enforce 2 signals per hour
-                            if signal_count_hour >= 2:
+                        try:
+                            data = json.loads(msg)
+                            if "tick" not in data:
                                 continue
 
-                            # Minimum interval between signals
-                            EXPIRY_MIN_INTERVAL = MIN_SIGNAL_INTERVAL
-                            if (now - last_signal_time).total_seconds() < EXPIRY_MIN_INTERVAL:
+                            pair = data["tick"]["symbol"]
+                            price = data["tick"]["quote"]
+                            prices[pair].append(price)
+
+                            if len(prices[pair]) < 60:
                                 continue
 
-                            accuracy = min(95, int(score))
-                            trend_type = "Stable Trend" if score < 90 else "Strong Breakout"
+                            # Trend analysis
+                            direction, score = analyze_pair(prices[pair])
+                            if not direction or score < 75:
+                                pending_signal = None
+                                signal_ready = False
+                                continue
 
-                            send_signal(pair, direction, accuracy, trend_type)
+                            # Tick confirmation
+                            if tick_confirm[pair]["dir"] == direction:
+                                tick_confirm[pair]["count"] += 1
+                            else:
+                                tick_confirm[pair] = {"dir": direction, "count": 1}
 
-                            last_signal_time = datetime.now(TIMEZONE)
-                            signal_count_hour += 1
+                            if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
+                                continue
 
-                            pending_signal = None
-                            signal_ready = False
+                            # Only send when consecutive confirmation
+                            if pending_signal and pending_signal[0] == pair and pending_signal[1] == direction:
+                                signal_ready = True
+                            else:
+                                pending_signal = (pair, direction, score)
+                                signal_ready = False
 
-                            # Wait for expiry before next signal
-                            await asyncio.sleep(EXPIRY_MINUTES * 60)
+                            if signal_ready:
+                                # Limit signals per hour
+                                if signal_count_hour >= 2:
+                                    continue
 
-            except Exception as e:
-                logging.error(f"WebSocket error, reconnecting: {e}")
+                                # Minimum interval
+                                if (now - last_signal_time).total_seconds() < MIN_SIGNAL_INTERVAL:
+                                    continue
+
+                                accuracy = min(95, int(score))
+                                trend_type = "Stable Trend" if score < 90 else "Strong Breakout"
+
+                                send_signal(pair, direction, accuracy, trend_type)
+
+                                last_signal_time = datetime.now(TIMEZONE)
+                                signal_count_hour += 1
+
+                                pending_signal = None
+                                signal_ready = False
+
+                                # Lock for expiry
+                                set_lock()
+
+                                # Wait for expiry
+                                await asyncio.sleep(EXPIRY_MINUTES * 60)
+
+                        except Exception as e_inner:
+                            logging.error(f"Tick processing error: {e_inner}")
+                            continue
+
+            except Exception as e_outer:
+                logging.error(f"WebSocket reconnecting due to: {e_outer}")
                 await asyncio.sleep(5)
 
 # ----------------------
