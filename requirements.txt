@@ -1,12 +1,5 @@
-# Telegram bot library
 python-telegram-bot==20.5
-
-# WebSocket support
 websockets==11.0.3
-
-# HTTP requests
 requests==2.31.0
-
-# Data and math processing
 numpy==1.26.0
-pytz==2026.3
+pytz==2025.2
