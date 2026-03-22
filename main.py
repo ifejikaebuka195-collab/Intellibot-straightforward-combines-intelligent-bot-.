@@ -1,136 +1,108 @@
+# =========================
+# Manual AI Trading System
+# Deployable with Deriv WebSocket
+# Telegram bot with buttons
+# =========================
+
 import asyncio
 import json
 import websockets
-import numpy as np
-from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# ================================
-# TELEGRAM BOT SETTINGS
-# ================================
+# -------------------------
+# CONFIGURATION
+# -------------------------
 BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
-
-# Pairs
-OTC_PAIRS = ["EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD"]
-CRYPTO_PAIRS = ["BTC/USD", "ETH/USD", "LTC/USD", "XRP/USD", "BCH/USD", "ADA/USD", "DOGE/USD"]
-
-# Timeframes
-TIMEFRAMES = ["1m", "2m", "5m", "15m", "30m"]
-
-# Selected values (manual)
-selected_pair = None
-selected_timeframe = None
-
-# WebSocket URL
 DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
-# ================================
+OTC_PAIRS = ["EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCAD", "NZDUSD", "CHFUSD"]
+CRYPTO_PAIRS = ["BTCUSD", "ETHUSD", "ADAUSD", "XRPUSD", "DOGEUSD", "SOLUSD", "LTCUSD"]
+TIMEFRAMES = ["1m", "2m", "5m", "15m", "30m"]
+
+# -------------------------
 # TELEGRAM HANDLERS
-# ================================
+# -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("OTC", callback_data="otc")],
-        [InlineKeyboardButton("Crypto", callback_data="crypto")]
+        [InlineKeyboardButton("OTC", callback_data="OTC")],
+        [InlineKeyboardButton("Crypto", callback_data="Crypto")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Select Market Type:", reply_markup=reply_markup)
+    await update.message.reply_text("Select market type:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global selected_pair, selected_timeframe
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    # Select market type
-    if data == "otc":
-        keyboard = [[InlineKeyboardButton(pair, callback_data=f"pair:{pair}")] for pair in OTC_PAIRS]
-        await query.edit_message_text("Select OTC Pair:", reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data == "crypto":
-        keyboard = [[InlineKeyboardButton(pair, callback_data=f"pair:{pair}")] for pair in CRYPTO_PAIRS]
-        await query.edit_message_text("Select Crypto Pair:", reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data.startswith("pair:"):
-        selected_pair = data.split(":")[1]
-        keyboard = [[InlineKeyboardButton(tf, callback_data=f"time:{tf}")] for tf in TIMEFRAMES]
-        await query.edit_message_text(f"Selected Pair: {selected_pair}\nSelect Timeframe:", reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data.startswith("time:"):
-        selected_timeframe = data.split(":")[1]
-        await query.edit_message_text(f"✅ Pair selected: {selected_pair}\n⏱ Timeframe: {selected_timeframe}\n⚡ Scanning market for signals...")
-        # Start scanning market once pair & timeframe selected
-        asyncio.create_task(scan_market(selected_pair, selected_timeframe, context))
+    # Market type selection
+    if data == "OTC":
+        pairs = OTC_PAIRS
+    elif data == "Crypto":
+        pairs = CRYPTO_PAIRS
+    else:
+        pairs = []
 
-# ================================
-# WEBSOCKET MARKET SCAN
-# ================================
-async def scan_market(pair, timeframe, context):
+    # Show pairs
+    keyboard = [[InlineKeyboardButton(p, callback_data=f"PAIR|{p}")] for p in pairs]
+    await query.edit_message_text(f"Select a pair ({data}):", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # Timeframe selection after pair is chosen
+    if data.startswith("PAIR|"):
+        pair_selected = data.split("|")[1]
+        keyboard = [[InlineKeyboardButton(tf, callback_data=f"TF|{pair_selected}|{tf}")] for tf in TIMEFRAMES]
+        await query.edit_message_text(f"Select timeframe for {pair_selected}:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # Timeframe chosen → scan market
+    if data.startswith("TF|"):
+        _, pair_selected, timeframe = data.split("|")
+        msg = f"✅ Pair selected: {pair_selected}\n⏱ Timeframe: {timeframe}\n⚡ Now scanning {pair_selected} and preparing signal..."
+        await query.edit_message_text(msg)
+        await asyncio.sleep(10)  # Wait for market data collection
+        # Placeholder for market scan, candlestick reading, indicators, real risk & accuracy
+        # In production, call your WebSocket scan functions here
+        signal_msg = f"🔔 Signal for {pair_selected} ({timeframe}) will appear here with real accuracy & risk."
+        await query.message.reply_text(signal_msg)
+
+# -------------------------
+# WEBSOCKET FUNCTION
+# -------------------------
+async def deriv_ws_listener():
     async with websockets.connect(DERIV_WS_URL) as ws:
-        # Subscribe to ticks
-        subscribe_msg = json.dumps({"ticks": pair})
-        await ws.send(subscribe_msg)
-        await asyncio.sleep(0.1)  # Give time for subscription
+        # Subscribe to all pairs
+        for pair in OTC_PAIRS + CRYPTO_PAIRS:
+            await ws.send(json.dumps({
+                "ticks": pair,
+                "subscribe": 1
+            }))
 
-        ticks = []
         while True:
-            if selected_pair != pair or selected_timeframe != timeframe:
-                break  # Stop scanning if selection changed
+            data = await ws.recv()
+            message = json.loads(data)
+            # TODO: Integrate candlestick calculation & 20 indicators analysis here
+            # Example: process ticks, calculate real risk, accuracy, duration
+            # print(message)
 
-            response = await ws.recv()
-            data = json.loads(response)
-
-            if "tick" in data:
-                ticks.append(data["tick"])
-            
-            # Analyze every 10-15 seconds
-            if len(ticks) >= 15:
-                signal_info = analyze_market(ticks, pair, timeframe)
-                await send_signal(context, signal_info)
-                ticks.clear()  # Clear ticks for next scan
-
-# ================================
-# MARKET ANALYSIS
-# ================================
-def analyze_market(ticks, pair, timeframe):
-    # Dummy placeholder for real indicator calculation
-    # Replace with full 20 indicators logic
-    price_series = np.array([tick["quote"] for tick in ticks])
-    real_accuracy = np.random.uniform(50, 95)  # Placeholder
-    real_risk = np.random.uniform(0.5, 5.0)    # Placeholder
-    duration = timeframe
-
-    # Decide signal
-    direction = "BUY" if price_series[-1] > price_series[0] else "SELL"
-
-    return {
-        "pair": pair,
-        "timeframe": timeframe,
-        "direction": direction,
-        "accuracy": round(real_accuracy, 2),
-        "risk": round(real_risk, 2),
-        "duration": duration
-    }
-
-# ================================
-# SEND SIGNAL TO TELEGRAM
-# ================================
-async def send_signal(context, signal_info):
-    msg = (
-        f"🔔 Signal for {signal_info['pair']} ({signal_info['timeframe']})\n"
-        f"Direction: {signal_info['direction']}\n"
-        f"Real Accuracy: {signal_info['accuracy']}%\n"
-        f"Real Risk: {signal_info['risk']}\n"
-        f"Recommended Duration: {signal_info['duration']}"
-    )
-    # Send message to all users (you can adjust chat_id or context.bot)
-    await context.bot.send_message(chat_id=context._chat_id, text=msg)
-
-# ================================
-# MAIN
-# ================================
-def main():
+# -------------------------
+# MAIN FUNCTION
+# -------------------------
+async def main():
+    # Telegram application
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button))
-    app.run_polling()
+    app.add_handler(CallbackQueryHandler(button_handler))
 
+    # Start WebSocket listener in background
+    asyncio.create_task(deriv_ws_listener())
+
+    # Run bot (handles asyncio loop internally)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    await app.updater.idle()
+
+# -------------------------
+# ENTRY POINT
+# -------------------------
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
