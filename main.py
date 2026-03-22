@@ -23,11 +23,11 @@ CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
-ENTRY_DELAY = 2      # minutes before final entry
-EXPIRY_MINUTES = 5   # minutes duration of signal
+ENTRY_DELAY = 1      # ⚡ FASTER (was 2)
+EXPIRY_MINUTES = 5
 
-MAX_PRICES = 10000   # ticks to store for each pair
-TICK_CONFIRMATION = 3
+MAX_PRICES = 10000
+TICK_CONFIRMATION = 2   # ⚡ FASTER (was 3)
 
 # ================================
 # BLOCKED PAIRS
@@ -55,17 +55,20 @@ def ema(data, period):
     return val
 
 # ================================
-# TREND DETECTION
+# TREND DETECTION (FASTER)
 # ================================
 def detect_trend(p):
-    if len(p) < 50:
+    if len(p) < 30:   # ⚡ was 50
         return None
-    e1 = ema(p[-10:], 3)
-    e2 = ema(p[-20:], 5)
-    e3 = ema(p[-30:], 8)
-    e4 = ema(p[-50:], 13)
+
+    e1 = ema(p[-7:], 3)
+    e2 = ema(p[-14:], 5)
+    e3 = ema(p[-21:], 8)
+    e4 = ema(p[-30:], 13)
+
     if not all([e1,e2,e3,e4]):
         return None
+
     if e1 > e2 and e3 > e4:
         return "BUY"
     elif e1 < e2 and e3 < e4:
@@ -73,45 +76,60 @@ def detect_trend(p):
     return None
 
 # ================================
-# BIG MOVE DETECTION
+# BIG MOVE DETECTION (FASTER)
 # ================================
 def big_move_ready(p, direction):
-    if len(p) < 50:
+    if len(p) < 30:   # ⚡ was 50
         return False
-    std = np.std(p[-30:])
-    mean = np.mean(p[-30:])
-    if std > 0.01 * mean:  # volatility filter
+
+    std = np.std(p[-20:])
+    mean = np.mean(p[-20:])
+
+    if std > 0.01 * mean:
         return False
-    diff = np.diff(p[-10:])
+
+    diff = np.diff(p[-7:])
+
     if direction == "BUY":
-        if np.sum(diff > 0) < 8 or not (diff[-1] > diff[-2] > diff[-3]):
+        if np.sum(diff > 0) < 5:
             return False
+        if not (diff[-1] > diff[-2]):
+            return False
+
     if direction == "SELL":
-        if np.sum(diff < 0) < 8 or not (diff[-1] < diff[-2] < diff[-3]):
+        if np.sum(diff < 0) < 5:
             return False
+        if not (diff[-1] < diff[-2]):
+            return False
+
     return True
 
 # ================================
 # ENTRY CONFIRMATION
 # ================================
 def entry_confirm(p, direction):
-    if len(p) < 15:
+    if len(p) < 10:
         return False
-    diff = np.diff(p[-10:])
+
+    diff = np.diff(p[-7:])
+
     if direction == "BUY":
-        return np.sum(diff > 0) >= 8
+        return np.sum(diff > 0) >= 5
     if direction == "SELL":
-        return np.sum(diff < 0) >= 8
+        return np.sum(diff < 0) >= 5
+
     return False
 
 # ================================
 # ACCURACY CALCULATION
 # ================================
 def get_accuracy(p):
-    if len(p) < 50:
+    if len(p) < 30:
         return 90
-    std = np.std(p[-30:])
-    mean = np.mean(p[-30:])
+
+    std = np.std(p[-20:])
+    mean = np.mean(p[-20:])
+
     if std/mean > 0.005:
         return 95
     return 90
@@ -156,24 +174,25 @@ Entry Time: {entry.strftime('%I:%M %p')}
                   data={"chat_id": CHAT_ID, "text": msg})
 
 # ================================
-# MARKET TIME SWITCH (SAFELY INTEGRATED)
+# MARKET TIME SWITCH
 # ================================
 def current_pairs():
     now = datetime.now(TIMEZONE)
-    weekday = now.weekday()  # Monday=0, Sunday=6
+    weekday = now.weekday()
     hour = now.hour
 
-    # Crypto active from Friday 10 PM to Sunday 12 AM
-    if (weekday == 4 and hour >= 22) or (weekday == 5) or (weekday == 6 and hour < 0):
+    if weekday in [0,1,2,3]:
+        return "OTC"
+    if weekday == 4 and hour < 22:
+        return "OTC"
+    if weekday == 4 and hour >= 22:
         return "CRYPTO"
-    # If deployed on weekend, start crypto immediately until Sunday 12 AM
-    if weekday == 6 and hour >= 0:
+    if weekday == 5:
         return "CRYPTO"
-    # Otherwise default to OTC
     return "OTC"
 
 # ================================
-# AUTO LOAD SYMBOLS FROM WEBSOCKET
+# AUTO LOAD SYMBOLS
 # ================================
 async def load_symbols(pair_type="OTC"):
     try:
@@ -182,9 +201,9 @@ async def load_symbols(pair_type="OTC"):
             res = json.loads(await ws.recv())
             all_symbols = [s["symbol"] for s in res["active_symbols"]]
 
-            # filter based on type and blocked
             if pair_type == "OTC":
                 return [s for s in all_symbols if s.startswith("frx") and s not in BLOCKED_PAIRS]
+
             elif pair_type == "CRYPTO":
                 crypto_list = [
                     "BTCUSD","ETHUSD","XRPUSD","LTCUSD","BCHUSD",
@@ -192,12 +211,13 @@ async def load_symbols(pair_type="OTC"):
                     "LINKUSD","TRXUSD","XLMUSD","MATICUSD","EOSUSD"
                 ]
                 return [s for s in crypto_list if s in all_symbols]
+
             return []
     except:
         return []
 
 # ================================
-# MAIN MONITOR FUNCTION
+# MAIN LOOP
 # ================================
 async def monitor():
     global pending_signal
@@ -219,11 +239,14 @@ async def monitor():
                     data = json.loads(msg)
                     if "tick" not in data:
                         continue
+
                     pair = data["tick"]["symbol"]
                     price = data["tick"]["quote"]
+
                     prices[pair].append(price)
                     if len(prices[pair]) > MAX_PRICES:
                         prices[pair].pop(0)
+
                     if locked():
                         continue
 
@@ -231,7 +254,6 @@ async def monitor():
                     if not direction:
                         continue
 
-                    # Tick confirmation
                     if tick_confirm[pair]["dir"] == direction:
                         tick_confirm[pair]["count"] += 1
                     else:
@@ -240,28 +262,17 @@ async def monitor():
                     if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                         continue
 
-                    # Big move confirmation
                     if not big_move_ready(prices[pair], direction):
                         continue
 
-                    # Send initial signal
                     send_asset(pair)
-                    pending_signal = {
-                        "pair": pair,
-                        "direction": direction,
-                        "time": datetime.now(TIMEZONE)
-                    }
 
-                    # Wait for entry
                     await asyncio.sleep(ENTRY_DELAY * 60)
 
-                    # Final check & send
                     acc = get_accuracy(prices[pair])
                     if entry_confirm(prices[pair], direction):
                         send_final(pair, direction, acc)
                         set_lock()
-
-                    pending_signal = None
 
         except:
             await asyncio.sleep(5)
