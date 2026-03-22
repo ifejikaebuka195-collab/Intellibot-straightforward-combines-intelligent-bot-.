@@ -143,75 +143,15 @@ async def get_symbols():
         return []
 
 # ----------------------
-# RESILIENT WEBSOCKET LOOP
-# ----------------------
-async def websocket_loop(symbols):
-    global last_signal_time, signal_count_hour, pending_signal, signal_ready
-
-    while True:
-        try:
-            async with websockets.connect(DERIV_WS, ping_interval=15, ping_timeout=10) as ws:
-                for s in symbols:
-                    await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
-
-                async for msg in ws:
-                    data = json.loads(msg)
-                    if "tick" not in data:
-                        continue
-
-                    pair = data["tick"]["symbol"]
-                    price = data["tick"]["quote"]
-                    prices[pair].append(price)
-
-                    if len(prices[pair]) < 60:
-                        continue
-
-                    # Analyze trend
-                    direction, score = analyze_pair(prices[pair])
-                    if not direction or score < 75:
-                        pending_signal = None
-                        signal_ready = False
-                        continue
-
-                    # Require consecutive tick alignment
-                    if pending_signal and pending_signal[0] == pair and pending_signal[1] == direction:
-                        signal_ready = True
-                    else:
-                        pending_signal = (pair, direction, score)
-                        signal_ready = False
-
-                    # Send signal only when ready
-                    if signal_ready:
-                        if signal_count_hour >= 2:
-                            continue
-                        now = datetime.now(TIMEZONE)
-                        if (now - last_signal_time).total_seconds() < EXPIRY_MIN_INTERVAL := MIN_SIGNAL_INTERVAL:
-                            continue
-
-                        accuracy = min(95, int(score))
-                        trend_type = "Stable Trend" if score < 90 else "Strong Breakout"
-
-                        send_signal(pair, direction, accuracy, trend_type)
-                        last_signal_time = datetime.now(TIMEZONE)
-                        signal_count_hour += 1
-
-                        pending_signal = None
-                        signal_ready = False
-
-                        # Wait for expiry before next signal
-                        await asyncio.sleep(EXPIRY_MINUTES * 60)
-
-        except (websockets.ConnectionClosed, websockets.InvalidStatusCode, asyncio.TimeoutError, AttributeError) as e:
-            logging.error(f"WebSocket error, reconnecting: {e}")
-            await asyncio.sleep(3)  # reconnect after short delay
-
-# ----------------------
-# MAIN LOOP
+# SYSTEM LOOP
 # ----------------------
 async def system_loop():
-    global last_hour
+    global last_signal_time, signal_count_hour, last_hour, pending_signal, signal_ready
+
     while True:
         now = datetime.now(TIMEZONE)
+
+        # Reset hourly counter
         if last_hour != now.hour:
             signal_count_hour = 0
             last_hour = now.hour
@@ -219,12 +159,75 @@ async def system_loop():
         weekday = now.weekday()
         hour = now.hour
 
+        # Determine symbols to track
         if (weekday == 4 and hour >= 21) or weekday in [5,6]:
             symbols = CRYPTO_PAIRS
         else:
             symbols = await get_symbols()
 
-        await websocket_loop(symbols)
+        # Safe WebSocket connection loop
+        while True:
+            try:
+                async with websockets.connect(DERIV_WS) as ws:
+                    # Subscribe to all symbols
+                    for s in symbols:
+                        await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
+
+                    async for msg in ws:
+                        data = json.loads(msg)
+
+                        if "tick" not in data:
+                            continue
+
+                        pair = data["tick"]["symbol"]
+                        price = data["tick"]["quote"]
+                        prices[pair].append(price)
+
+                        if len(prices[pair]) < 60:
+                            continue
+
+                        # Analyze trend
+                        direction, score = analyze_pair(prices[pair])
+                        if not direction or score < 75:
+                            pending_signal = None
+                            signal_ready = False
+                            continue
+
+                        # Trend stabilization: require consecutive tick alignment
+                        if pending_signal and pending_signal[0] == pair and pending_signal[1] == direction:
+                            signal_ready = True
+                        else:
+                            pending_signal = (pair, direction, score)
+                            signal_ready = False
+
+                        # Send signal only when ready
+                        if signal_ready:
+                            # Enforce 2 signals per hour
+                            if signal_count_hour >= 2:
+                                continue
+
+                            # Minimum interval between signals
+                            EXPIRY_MIN_INTERVAL = MIN_SIGNAL_INTERVAL
+                            if (now - last_signal_time).total_seconds() < EXPIRY_MIN_INTERVAL:
+                                continue
+
+                            accuracy = min(95, int(score))
+                            trend_type = "Stable Trend" if score < 90 else "Strong Breakout"
+
+                            send_signal(pair, direction, accuracy, trend_type)
+
+                            last_signal_time = datetime.now(TIMEZONE)
+                            signal_count_hour += 1
+
+                            pending_signal = None
+                            signal_ready = False
+
+                            # Wait for expiry before next signal
+                            await asyncio.sleep(EXPIRY_MINUTES * 60)
+
+            except Exception as e:
+                logging.error(f"WebSocket error, reconnecting: {e}")
+                await asyncio.sleep(5)
 
 # ----------------------
 # RUN SYSTEM
