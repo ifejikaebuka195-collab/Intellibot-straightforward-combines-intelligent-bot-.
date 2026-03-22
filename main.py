@@ -9,18 +9,15 @@ import numpy as np
 import logging
 
 # ----------------------
-# CONFIG
+# CONFIGURATION
 # ----------------------
 BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
 CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
-
-EXPIRY_MINUTES = 5
-ENTRY_DELAY = 2
+EXPIRY_MINUTES = 5  # Trade duration
+ENTRY_DELAY = 2     # Delay before entry
 MAX_PRICES = 5000
-
-# ✅ 15 CRYPTO PAIRS (DERIV OTC)
 CRYPTO_PAIRS = [
     "cryBTCUSD","cryETHUSD","cryLTCUSD","cryXRPUSD","cryBCHUSD",
     "cryEOSUSD","cryTRXUSD","cryADAUSD","cryBNBUSD","cryDOTUSD",
@@ -31,13 +28,11 @@ CRYPTO_PAIRS = [
 # STATE
 # ----------------------
 prices = defaultdict(lambda: deque(maxlen=MAX_PRICES))
-tick_confirm = defaultdict(lambda: {"dir": None, "count": 0})
 lock_until = None
-
 logging.basicConfig(level=logging.INFO)
 
 # ----------------------
-# EMA
+# EMA CALCULATION
 # ----------------------
 def ema(data, period):
     if len(data) < period:
@@ -73,9 +68,6 @@ def analyze_pair(p):
     elif e1 < e2 < e3 < e4:
         direction = "SELL"
         score += 30
-
-    if not direction:
-        return None, None, None
 
     diff = np.diff(p[-10:])
     if direction == "BUY" and np.sum(diff > 0) >= 8:
@@ -115,7 +107,7 @@ def analyze_pair(p):
     return None, None, None
 
 # ----------------------
-# TELEGRAM
+# TELEGRAM SIGNAL
 # ----------------------
 def send_signal(pair, direction, acc, trend):
     entry_time = datetime.now(TIMEZONE) + timedelta(minutes=ENTRY_DELAY)
@@ -128,7 +120,7 @@ Pair: {pair}
 Direction: {direction} {arrow}
 Type: {trend}
 Accuracy: {acc}%
-Entry Time: {entry_time.strftime('%H:%M')}
+Entry Time: {entry_time.strftime('%H:%M:%S')}
 Expiry: {EXPIRY_MINUTES} min
 """
     try:
@@ -144,13 +136,12 @@ Expiry: {EXPIRY_MINUTES} min
 # MAIN LOOP
 # ----------------------
 async def main():
-    global lock_until, tick_confirm
+    global lock_until
 
     while True:
         try:
             async with websockets.connect(DERIV_WS) as ws:
-
-                # Subscribe to crypto pairs
+                # Subscribe to all 15 crypto pairs
                 for s in CRYPTO_PAIRS:
                     await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
 
@@ -161,34 +152,26 @@ async def main():
 
                     pair = data["tick"]["symbol"]
                     price = data["tick"]["quote"]
+
                     prices[pair].append(price)
 
-                    # Only allow one active signal
+                    # Wait until current signal expires
                     if lock_until and datetime.now(TIMEZONE) < lock_until:
                         continue
 
                     direction, acc, trend = analyze_pair(prices[pair])
                     if not direction:
-                        tick_confirm[pair] = {"dir": None, "count": 0}
                         continue
 
-                    if tick_confirm[pair]["dir"] == direction:
-                        tick_confirm[pair]["count"] += 1
-                    else:
-                        tick_confirm[pair] = {"dir": direction, "count": 1}
-
-                    if tick_confirm[pair]["count"] < 3:
+                    # Confirm move stability
+                    recent_diff = np.diff(list(prices[pair])[-5:])
+                    if direction == "BUY" and not np.all(recent_diff > 0):
+                        continue
+                    elif direction == "SELL" and not np.all(recent_diff < 0):
                         continue
 
-                    # Wait for ENTRY_DELAY seconds before sending signal
-                    await asyncio.sleep(ENTRY_DELAY)
                     send_signal(pair, direction, acc, trend)
-
-                    # Lock scanning until current signal expires
                     lock_until = datetime.now(TIMEZONE) + timedelta(minutes=EXPIRY_MINUTES)
-
-                    # Reset tick confirmations after expiry
-                    tick_confirm.clear()
 
         except Exception as e:
             logging.error(f"Reconnect: {e}")
