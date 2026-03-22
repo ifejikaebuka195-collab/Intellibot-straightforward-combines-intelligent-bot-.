@@ -12,7 +12,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
 DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
 # ✅ ONLY REAL MARKET PAIRS
