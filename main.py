@@ -16,7 +16,7 @@ BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
 DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
 # ✅ ONLY REAL MARKET PAIRS
-OTC_PAIRS = ["R_100", "R_75", "R_50", "R_25", "R_10", "R_10S", "R_25S"]
+OTC_PAIRS = ["frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxUSDCAD", "frxUSDCHF", "frxNZDUSD"]
 CRYPTO_PAIRS = ["cryBTCUSD", "cryETHUSD", "cryLTCUSD", "cryXRPUSD", "cryBCHUSD", "cryEOSUSD", "cryTRXUSD"]
 
 TIMEFRAMES = ["1m", "2m", "3m", "5m", "15m", "30m"]
@@ -24,14 +24,14 @@ TIMEFRAMES = ["1m", "2m", "3m", "5m", "15m", "30m"]
 # =========================
 # GLOBAL STORAGE
 # =========================
-MAX_TICKS = 500  # store more ticks for fast signal
+MAX_TICKS = 500
 TICKS = {pair: deque(maxlen=MAX_TICKS) for pair in OTC_PAIRS + CRYPTO_PAIRS}
 CONNECTED = False
 
 logging.basicConfig(level=logging.INFO)
 
 # =========================
-# DERIV WEBSOCKET ENGINE (FAST COLLECTION)
+# DERIV FAST WEBSOCKET ENGINE
 # =========================
 async def websocket_manager():
     global CONNECTED
@@ -41,7 +41,7 @@ async def websocket_manager():
                 CONNECTED = True
                 logging.info("🌐 Connected to Deriv WebSocket")
 
-                # ✅ SUBSCRIBE TO ALL PAIRS
+                # ✅ SUBSCRIBE TO ALL REAL MARKET PAIRS
                 for pair in OTC_PAIRS + CRYPTO_PAIRS:
                     await ws.send(json.dumps({
                         "ticks": pair,
@@ -49,7 +49,6 @@ async def websocket_manager():
                     }))
                     logging.info(f"✅ Subscribed to {pair}")
 
-                # ✅ RECEIVE LIVE TICKS
                 async for msg in ws:
                     data = json.loads(msg)
                     if "tick" in data:
@@ -66,7 +65,7 @@ async def websocket_manager():
 # =========================
 # FAST INDICATOR ENGINE
 # =========================
-def analyze_market(prices):
+def analyze_market(prices, tf):
     if len(prices) < 30:
         return None
 
@@ -88,7 +87,17 @@ def analyze_market(prices):
     direction = "BUY 🔼" if score >= 10 else "SELL 🔽"
     accuracy = round((score / 20) * 100)
     risk = round((100 - accuracy) / 10, 2)
-    duration = random.choice(["1 min", "2 min", "3 min", "5 min"])
+
+    # DURATION MATCHES TIMEFRAME SELECTED
+    duration_map = {
+        "1m": "1 min",
+        "2m": "2 min",
+        "3m": "3 min",
+        "5m": "5 min",
+        "15m": "15 min",
+        "30m": "30 min"
+    }
+    duration = duration_map.get(tf, "1 min")
 
     return direction, accuracy, risk, duration
 
@@ -110,7 +119,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    # MARKET
     if data == "OTC":
         keyboard = [[InlineKeyboardButton(p, callback_data=f"PAIR_{p}")] for p in OTC_PAIRS]
         await query.edit_message_text("OTC Market:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -119,38 +127,35 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton(p, callback_data=f"PAIR_{p}")] for p in CRYPTO_PAIRS]
         await query.edit_message_text("Crypto Market:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # PAIR
     elif data.startswith("PAIR_"):
         pair = "_".join(data.split("_")[1:])
         context.user_data["pair"] = pair
         keyboard = [[InlineKeyboardButton(tf, callback_data=f"TF_{tf}")] for tf in TIMEFRAMES]
         await query.edit_message_text(f"{pair} selected.\nSelect timeframe:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # TIMEFRAME
     elif data.startswith("TF_"):
         tf = "_".join(data.split("_")[1:])
         pair = context.user_data.get("pair")
 
-        await query.edit_message_text(
-            f"✅ Pair selected: {pair}\n"
-            f"⏱ Timeframe: {tf}\n"
-            f"⚡ Now scanning..."
-        )
+        # CLEAR PREVIOUS MESSAGES BEFORE SENDING NEW SIGNAL
+        chat_id = query.message.chat_id
+        await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
 
         await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="⏳ Please wait 15 seconds for real signal, risk & accuracy..."
+            chat_id=chat_id,
+            text=f"✅ Pair selected: {pair}\n⏱ Timeframe: {tf}\n⚡ Now scanning..."
         )
 
         await asyncio.sleep(15)
 
         prices = list(TICKS.get(pair, []))
-        result = analyze_market(prices)
+        result = analyze_market(prices, tf)
 
         if result:
             direction, accuracy, risk, duration = result
+            # SEND ONLY THE SIGNAL, CLEAR OTHER MESSAGES
             await context.bot.send_message(
-                chat_id=query.message.chat_id,
+                chat_id=chat_id,
                 text=(
                     f"📊 SIGNAL RESULT\n\n"
                     f"Pair: {pair}\n"
@@ -165,12 +170,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("RESET", callback_data="RESET")
                 ]])
             )
-            await asyncio.sleep(5)
 
         else:
-            await context.bot.send_message(chat_id=query.message.chat_id, text="❌ Not enough data yet. Try again.")
+            await context.bot.send_message(chat_id=chat_id, text="❌ Not enough data yet. Try again.")
 
-    # RESET
     elif data == "RESET":
         keyboard = [[
             InlineKeyboardButton("OTC", callback_data="OTC"),
@@ -187,7 +190,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(buttons))
 
-    # Start websocket task for fast tick collection
     loop = asyncio.get_event_loop()
     loop.create_task(websocket_manager())
 
