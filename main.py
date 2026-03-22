@@ -32,7 +32,7 @@ CRYPTO_PAIRS = [
 # ----------------------
 prices = defaultdict(lambda: deque(maxlen=MAX_PRICES))
 tick_confirm = defaultdict(lambda: {"dir": None, "count": 0})
-lock_until = None
+active_signal_lock = None  # Global lock: only 1 signal active at a time
 
 logging.basicConfig(level=logging.INFO)
 
@@ -145,13 +145,13 @@ Expiry: {EXPIRY_MINUTES} min
 # MAIN LOOP
 # ----------------------
 async def main():
-    global lock_until
+    global active_signal_lock
 
     while True:
         try:
             async with websockets.connect(DERIV_WS) as ws:
 
-                # ✅ Subscribe to crypto pairs directly
+                # Subscribe to crypto pairs directly
                 for s in CRYPTO_PAIRS:
                     await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
 
@@ -166,7 +166,8 @@ async def main():
 
                     prices[pair].append(price)
 
-                    if lock_until and datetime.now(TIMEZONE) < lock_until:
+                    # If a signal is active, wait until it expires
+                    if active_signal_lock and datetime.now(TIMEZONE) < active_signal_lock:
                         continue
 
                     direction, acc, trend = analyze_pair(prices[pair])
@@ -175,6 +176,7 @@ async def main():
                         tick_confirm[pair] = {"dir": None, "count": 0}
                         continue
 
+                    # Tick confirmation (3 consecutive ticks)
                     if tick_confirm[pair]["dir"] == direction:
                         tick_confirm[pair]["count"] += 1
                     else:
@@ -183,13 +185,22 @@ async def main():
                     if tick_confirm[pair]["count"] < 3:
                         continue
 
-                    await asyncio.sleep(2)
+                    # ✅ Delay for entry time
+                    await asyncio.sleep(ENTRY_DELAY)
 
+                    # Send the signal
                     send_signal(pair, direction, acc, trend)
 
-                    lock_until = datetime.now(TIMEZONE) + timedelta(
-                        minutes=ENTRY_DELAY + EXPIRY_MINUTES
-                    )
+                    # Lock the system until this signal expires
+                    active_signal_lock = datetime.now(TIMEZONE) + timedelta(minutes=EXPIRY_MINUTES)
+
+                    # Wait until expiry before scanning for new signals
+                    await asyncio.sleep(EXPIRY_MINUTES * 60)
+
+                    # Reset tick confirmations after expiry
+                    tick_confirm = defaultdict(lambda: {"dir": None, "count": 0})
+                    active_signal_lock = None
+                    prices[pair].clear()  # optional: clear this pair's history after signal
 
         except Exception as e:
             logging.error(f"Reconnect: {e}")
