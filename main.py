@@ -156,22 +156,21 @@ Entry Time: {entry.strftime('%I:%M %p')}
                   data={"chat_id": CHAT_ID, "text": msg})
 
 # ================================
-# MARKET TIME SWITCH
+# MARKET TIME SWITCH (SAFELY INTEGRATED)
 # ================================
 def current_pairs():
     now = datetime.now(TIMEZONE)
     weekday = now.weekday()  # Monday=0, Sunday=6
     hour = now.hour
-    if weekday < 4:  # Mon–Thu
-        return "OTC"
-    elif weekday == 4 and hour >= 22:  # Fri 10 PM
+
+    # Crypto active from Friday 10 PM to Sunday 12 AM
+    if (weekday == 4 and hour >= 22) or (weekday == 5) or (weekday == 6 and hour < 0):
         return "CRYPTO"
-    elif weekday == 5 or (weekday == 4 and hour >= 22):  # Sat + Fri night
+    # If deployed on weekend, start crypto immediately until Sunday 12 AM
+    if weekday == 6 and hour >= 0:
         return "CRYPTO"
-    elif weekday == 6 and hour < 0:  # Sun before 12 AM
-        return "CRYPTO"
-    else:
-        return "OTC"
+    # Otherwise default to OTC
+    return "OTC"
 
 # ================================
 # AUTO LOAD SYMBOLS FROM WEBSOCKET
