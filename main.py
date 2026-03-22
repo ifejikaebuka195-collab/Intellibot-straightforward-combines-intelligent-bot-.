@@ -1,74 +1,56 @@
-# ==========================================
-# SMALL DERIV TICK STREAMER (REAL WEBSOCKET)
-# ==========================================
-
 import asyncio
 import json
 import websockets
+import logging
 from collections import deque
 
-# ✅ CONFIG
-DERIV_APP_ID = "1089"
-DERIV_API_TOKEN = "YOUR_DERIV_API_TOKEN"
-DERIV_WS_URL = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
+# ----------------------
+# CONFIG
+# ----------------------
+DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
-# ✅ SYMBOLS
-OTC_PAIRS = ["R_100", "R_75", "R_50", "R_25", "R_10", "R_10S", "R_25S"]
-CRYPTO_PAIRS = ["cryBTCUSD", "cryETHUSD", "cryLTCUSD", "cryXRPUSD", "cryBCHUSD", "cryEOSUSD", "cryTRXUSD"]
+# Example pairs to stream
+PAIRS = ["R_100", "R_75", "cryBTCUSD", "cryETHUSD"]
 
-ALL_PAIRS = OTC_PAIRS + CRYPTO_PAIRS
+# Max number of ticks to store
+MAX_TICKS = 100
 
-# ✅ GLOBAL STORAGE
-TICKS = {pair: deque(maxlen=300) for pair in ALL_PAIRS}
+# Storage for ticks
+ticks = {pair: deque(maxlen=MAX_TICKS) for pair in PAIRS}
 
-# =========================
-# DERIV WEBSOCKET CONNECTOR
-# =========================
+logging.basicConfig(level=logging.INFO)
+
+# ----------------------
+# STREAM TICKS
+# ----------------------
 async def stream_ticks():
     while True:
         try:
-            print("🌐 Connecting to Deriv WebSocket...")
-            async with websockets.connect(DERIV_WS_URL) as ws:
+            async with websockets.connect(DERIV_WS) as ws:
+                logging.info("🌐 Connected to Deriv WebSocket")
 
-                # AUTHORIZE ACCOUNT
-                await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
-                auth_resp = json.loads(await ws.recv())
+                # Subscribe to all pairs
+                for pair in PAIRS:
+                    await ws.send(json.dumps({
+                        "ticks": pair,
+                        "subscribe": 1
+                    }))
+                    logging.info(f"✅ Subscribed to {pair}")
 
-                if "error" in auth_resp:
-                    print("❌ Authorization failed:", auth_resp)
-                    await asyncio.sleep(5)
-                    continue
-                print("✅ Authorized with Deriv WebSocket!")
-
-                # SUBSCRIBE TO ALL PAIRS
-                for pair in ALL_PAIRS:
-                    await ws.send(json.dumps({"ticks": pair, "subscribe": 1}))
-
-                print("✅ Subscribed to all pairs. Streaming ticks...")
-
-                # STREAM TICKS
-                while True:
-                    msg = await ws.recv()
+                # Receive ticks
+                async for msg in ws:
                     data = json.loads(msg)
-
                     if "tick" in data:
                         symbol = data["tick"]["symbol"]
-                        price = data["tick"]["quote"]
-                        TICKS[symbol].append(price)
-                        print(f"💹 {symbol}: {price}")
+                        quote = data["tick"]["quote"]
+                        ticks[symbol].append(quote)
+                        logging.info(f"💹 {symbol}: {quote}")
 
         except Exception as e:
-            print("⚠️ Connection lost, reconnecting in 3s...", e)
+            logging.error(f"❌ Connection lost: {e}. Reconnecting in 3s...")
             await asyncio.sleep(3)
 
-# =========================
-# MAIN
-# =========================
-def main():
-    loop = asyncio.get_event_loop()
-    loop.create_task(stream_ticks())
-    print("🚀 Tick streamer started. Check your deployed console for live ticks.")
-    loop.run_forever()
-
-if __name__ == "__main__":
-    main()
+# ----------------------
+# RUN
+# ----------------------
+asyncio.run(stream_ticks())
