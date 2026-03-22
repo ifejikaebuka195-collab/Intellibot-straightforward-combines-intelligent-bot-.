@@ -7,8 +7,8 @@ import asyncio
 import json
 import websockets
 import random
-import time
 from collections import deque
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -56,7 +56,7 @@ LAST_UPDATE = {pair: 0 for pair in OTC_PAIRS + CRYPTO_PAIRS}
 CONNECTED = False
 
 # =========================
-# 🔥 ULTRA FAST WEBSOCKET ENGINE
+# 🔥 ULTRA FAST WEBSOCKET ENGINE (FROM TEST SCRIPT)
 # =========================
 async def websocket_manager():
     global CONNECTED
@@ -70,7 +70,7 @@ async def websocket_manager():
                 auth = json.loads(await ws.recv())
                 if "error" in auth:
                     CONNECTED = False
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(10)
                     continue
 
                 subscribed = set()
@@ -96,11 +96,14 @@ async def websocket_manager():
                             if symbol in TICKS and now - LAST_UPDATE[symbol] > 0.05:
                                 TICKS[symbol].append(price)
                                 LAST_UPDATE[symbol] = now
+                                # 🔥 Print live tick for deploy page
+                                print(f"[{symbol}] {price}")
+
                     except:
                         break
         except:
             CONNECTED = False
-            await asyncio.sleep(2)
+            await asyncio.sleep(10)  # 🔁 Retry every 10 seconds
 
 # =========================
 # 🔥 SUPER FAST INDICATOR ENGINE
@@ -153,7 +156,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("TF_"):
         tf = data.split("_")[1]
         pair = context.user_data.get("pair")
-        await query.edit_message_text(
+        await context.edit_message_text(
             f"✅ Pair selected: {pair}\n⏱ Timeframe: {tf}\n⚡ Now scanning {pair}..."
         )
         await context.bot.send_message(chat_id=query.message.chat_id, text="🔔 Signal will appear with real accuracy & risk.")
