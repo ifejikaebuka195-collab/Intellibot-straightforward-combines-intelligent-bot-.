@@ -1,7 +1,7 @@
 # ======================================
-# DERIV OTC SIGNAL BOT
-# FULL REAL-MARKET ADAPTIVE SYSTEM WITH AUTO EXIT
-# DYNAMIC PULLBACK + REVERSAL + ADAPTIVE EXIT + COOLDOWN
+# DERIV OTC SIGNAL BOT - HIGH CONFIDENCE
+# REAL MARKET, SINGLE ENTRY PER PAIR, AUTO EXIT
+# PROBABILITY CONFIDENCE CHECK + DYNAMIC EXIT
 # ======================================
 
 import asyncio
@@ -21,11 +21,9 @@ TIMEZONE = pytz.timezone("Africa/Lagos")
 MAX_PRICES = 5000
 TICK_CONFIRMATION = 3
 COOLDOWN_MINUTES = 2
+CONFIDENCE_THRESHOLD = 90  # minimum % probability to send signal
 
-# ================================
-# BLOCKED PAIRS
-# ================================
-BLOCKED_PAIRS = ["frxUSDNOK", "frxGBPNOK", "frxUSDPLN", "frxGBPNZD", "frxUSDSEK"]
+BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 
 prices = {}
 tick_confirm = {}
@@ -75,7 +73,7 @@ def detect_pullback(p, direction):
     return False
 
 # ================================
-# STRICT REVERSAL DETECTION
+# REVERSAL DETECTION
 # ================================
 def detect_reversal(p):
     window = min(20, len(p))
@@ -121,16 +119,32 @@ def entry_confirm(p, direction):
     return False
 
 # ================================
-# ACCURACY (ADAPTIVE)
+# CONFIDENCE CALCULATION
 # ================================
-def get_accuracy(p):
-    if len(p) < 50:
-        return 85
-    std = np.std(p[-30:])
-    mean = np.mean(p[-30:])
-    if std / mean > 0.005:
-        return 90
-    return 85
+def calculate_confidence(p, direction):
+    # trend alignment score
+    trend_score = 0
+    e1 = ema(p[-20:], 5)
+    e2 = ema(p[-50:], 13)
+    e3 = ema(p[-100:], 21)
+    if direction == "BUY" and e1 > e2 > e3:
+        trend_score = 50
+    elif direction == "SELL" and e1 < e2 < e3:
+        trend_score = 50
+
+    # price momentum score
+    recent_diff = np.diff(np.array(p[-10:]))
+    if direction in ["BUY", "BUY_REVERSE"]:
+        momentum_score = min(30, np.sum(recent_diff > 0) * 3)
+    else:
+        momentum_score = min(30, np.sum(recent_diff < 0) * 3)
+
+    # volatility score
+    vol = np.std(p[-20:])
+    vol_score = max(0, 20 - int(vol * 1000))  # lower volatility increases confidence
+
+    total_confidence = trend_score + momentum_score + vol_score
+    return total_confidence
 
 # ================================
 # COOLDOWN / LOCK
@@ -190,6 +204,7 @@ async def monitor():
             for s in symbols:
                 prices[s] = []
                 tick_confirm[s] = {"count": 0, "dir": None}
+                pending_signal[s] = None
 
             async with websockets.connect(DERIV_WS) as ws:
                 for s in symbols:
@@ -200,13 +215,16 @@ async def monitor():
                         data = json.loads(msg)
                         if "tick" not in data:
                             continue
+
                         pair = data["tick"]["symbol"]
                         price = data["tick"]["quote"]
+
                         prices[pair].append(price)
                         if len(prices[pair]) > MAX_PRICES:
                             prices[pair].pop(0)
 
-                        if locked(pair):
+                        # Skip if locked or signal already pending
+                        if locked(pair) or pending_signal[pair] is not None:
                             continue
 
                         # Detect trend
@@ -236,35 +254,36 @@ async def monitor():
                         if not big_move_ready(prices[pair], direction):
                             continue
 
+                        # Calculate confidence
+                        confidence = calculate_confidence(prices[pair], direction)
+                        if confidence < CONFIDENCE_THRESHOLD:
+                            continue  # skip low-confidence signals
+
                         # Adaptive duration
                         duration = max(1, min(5, int(np.std(prices[pair][-20:])*200)))
-
-                        # Accuracy
                         acc = get_accuracy(prices[pair])
 
-                        # Send entry signal
+                        # Lock and send signal
+                        pending_signal[pair] = {"direction": direction, "start": datetime.now(TIMEZONE)}
                         send_signal(pair, direction, duration, acc)
                         set_cooldown(pair, duration + COOLDOWN_MINUTES)
 
-                        # Auto-exit tracking
+                        # Auto-exit
                         exit_triggered = False
-                        entry_price = prices[pair][-1]
                         start_time = datetime.now(TIMEZONE)
                         while not exit_triggered:
                             await asyncio.sleep(1)
                             if len(prices[pair]) < 5:
                                 continue
-                            current_price = prices[pair][-1]
-                            # Exit if trend reverses
-                            trend_now = detect_trend(prices[pair])
-                            if trend_now != direction:
+                            current_trend = detect_trend(prices[pair])
+                            if current_trend != direction:
                                 exit_triggered = True
                                 send_exit(pair, direction)
-                            # Exit if duration exceeded
-                            if (datetime.now(TIMEZONE) - start_time).seconds / 60 >= duration:
+                            elif (datetime.now(TIMEZONE) - start_time).seconds / 60 >= duration:
                                 exit_triggered = True
                                 send_exit(pair, direction)
 
+                        pending_signal[pair] = None
                         tick_confirm[pair] = {"count": 0, "dir": None}
 
                     except:
