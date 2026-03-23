@@ -1,9 +1,8 @@
 import asyncio
 import json
 import websockets
-import random
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -31,7 +30,7 @@ CONNECTED = False
 logging.basicConfig(level=logging.INFO)
 
 # =========================
-# DERIV FAST WEBSOCKET ENGINE
+# FAST REAL MARKET WEBSOCKET ENGINE
 # =========================
 async def websocket_manager():
     global CONNECTED
@@ -41,7 +40,7 @@ async def websocket_manager():
                 CONNECTED = True
                 logging.info("🌐 Connected to Deriv WebSocket")
 
-                # ✅ SUBSCRIBE TO ALL REAL MARKET PAIRS
+                # SUBSCRIBE TO ALL REAL MARKET PAIRS ONLY
                 for pair in OTC_PAIRS + CRYPTO_PAIRS:
                     await ws.send(json.dumps({
                         "ticks": pair,
@@ -63,7 +62,7 @@ async def websocket_manager():
             await asyncio.sleep(3)
 
 # =========================
-# REAL MARKET ACCURACY & FAST FILTER ENGINE
+# REAL MARKET ACCURACY & FILTER ENGINE
 # =========================
 def analyze_market(prices, tf):
     if len(prices) < 30:
@@ -74,7 +73,7 @@ def analyze_market(prices, tf):
     momentum = prices[-1] - prices[-5]
     volatility = max(prices) - min(prices)
 
-    # 20 INDICATORS LOGIC
+    # 20 INDICATORS LOGIC (for direction only)
     signals = [
         last > avg, last > avg, momentum > 0, momentum > 0,
         volatility > 0, momentum > 0, volatility > 0, momentum > 0,
@@ -82,26 +81,27 @@ def analyze_market(prices, tf):
         last > avg, True, momentum > 0, momentum > 0,
         last > avg, momentum > 0, last > avg, volatility > 0
     ]
-
     score = sum(1 for s in signals if s)
     direction = "BUY 🔼" if score >= 10 else "SELL 🔽"
 
-    # ✅ REAL ACCURACY FROM MARKET DATA
-    # Using last 30 ticks as real-time market reference
+    # ✅ REAL MARKET ACCURACY
     recent = prices[-30:]
-    wins = sum(1 for i in range(1, len(recent)) if (recent[i] - recent[i-1] > 0 and direction == "BUY 🔼") or
-                                      (recent[i] - recent[i-1] < 0 and direction == "SELL 🔽"))
+    wins = sum(
+        1 for i in range(1, len(recent))
+        if (recent[i] - recent[i-1] > 0 and direction == "BUY 🔼") or
+           (recent[i] - recent[i-1] < 0 and direction == "SELL 🔽")
+    )
     accuracy = round((wins / len(recent)) * 100)
     accuracy = max(min(accuracy, 100), 0)
 
-    # RISK ESTIMATION FROM MARKET VOLATILITY
+    # RISK FROM MARKET VOLATILITY
     risk = round(volatility / last * 100, 2)
 
     # FILTER 95% BAD SIGNALS
     if accuracy < 95:
         return None
 
-    # DURATION MATCHES TIMEFRAME SELECTED
+    # DURATION MATCHES SELECTED TIMEFRAME
     duration_map = {
         "1m": "1 min",
         "2m": "2 min",
@@ -149,24 +149,22 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("TF_"):
         tf = "_".join(data.split("_")[1:])
         pair = context.user_data.get("pair")
-
         chat_id = query.message.chat_id
-        # CLEAR PREVIOUS MESSAGES
-        await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
 
+        # CLEAR PREVIOUS MESSAGES BEFORE SENDING SIGNAL
+        await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"✅ Pair selected: {pair}\n⏱ Timeframe: {tf}\n⚡ Scanning for profitable signals..."
         )
 
         await asyncio.sleep(15)
-
         prices = list(TICKS.get(pair, []))
         result = analyze_market(prices, tf)
 
         if result:
             direction, accuracy, risk, duration = result
-            # SEND ONLY PROFITABLE SIGNAL
+            # SEND ONLY HIGHLY PROFITABLE SIGNAL
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
