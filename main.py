@@ -3,7 +3,7 @@ import json
 import websockets
 import random
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 import os
 
@@ -16,8 +16,13 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
 DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
-# ✅ ONLY REAL MARKET PAIRS
-OTC_PAIRS = ["R_100", "R_75", "R_50", "R_25", "R_10", "R_10S", "R_25S"]
+# ✅ REAL MARKET PAIRS
+# Added 10 popularly known FOREX OTC pairs
+OTC_PAIRS = [
+    "frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxUSDCAD",
+    "frxUSDCHF", "frxNZDUSD", "frxEURGBP", "frxEURJPY", "frxGBPJPY"
+]
+
 CRYPTO_PAIRS = ["cryBTCUSD", "cryETHUSD", "cryLTCUSD", "cryXRPUSD", "cryBCHUSD", "cryEOSUSD", "cryTRXUSD"]
 
 TIMEFRAMES = ["1m", "2m", "3m", "5m", "15m", "30m"]
@@ -25,11 +30,10 @@ TIMEFRAMES = ["1m", "2m", "3m", "5m", "15m", "30m"]
 # =========================
 # GLOBAL STORAGE
 # =========================
-MAX_TICKS = 500  # store more ticks for fast signal
+MAX_TICKS = 500
 TICKS = {pair: deque(maxlen=MAX_TICKS) for pair in OTC_PAIRS + CRYPTO_PAIRS}
 CONNECTED = False
 
-# Memory storage for win/loss learning
 MEMORY_FILE = "trade_memory.json"
 MEMORY = {"wins": [], "losses": []}
 
@@ -49,7 +53,7 @@ def save_memory():
         json.dump(MEMORY, f, indent=4)
 
 # =========================
-# DERIV WEBSOCKET ENGINE (FAST COLLECTION)
+# DERIV WEBSOCKET ENGINE
 # =========================
 async def websocket_manager():
     global CONNECTED
@@ -59,7 +63,6 @@ async def websocket_manager():
                 CONNECTED = True
                 logging.info("🌐 Connected to Deriv WebSocket")
 
-                # Subscribe to all pairs
                 for pair in OTC_PAIRS + CRYPTO_PAIRS:
                     await ws.send(json.dumps({
                         "ticks": pair,
@@ -67,7 +70,6 @@ async def websocket_manager():
                     }))
                     logging.info(f"✅ Subscribed to {pair}")
 
-                # Receive live ticks
                 async for msg in ws:
                     data = json.loads(msg)
                     if "tick" in data:
@@ -93,7 +95,6 @@ def analyze_market(prices):
     momentum = last - prices[-5]
     volatility = max(prices) - min(prices)
 
-    # Signal logic
     signals = [
         last > avg, last > avg, momentum > 0, momentum > 0,
         volatility > 0, momentum > 0, volatility > 0, momentum > 0,
@@ -108,7 +109,6 @@ def analyze_market(prices):
     risk = round((100 - accuracy) / 10, 2)
     duration = random.choice(["1 min", "2 min", "3 min", "5 min"])
 
-    # Include the setup for learning
     setup = {
         "last": last,
         "avg": avg,
@@ -118,6 +118,15 @@ def analyze_market(prices):
     }
 
     return direction, accuracy, risk, duration, setup
+
+# =========================
+# CHECK IF SETUP IS VALID
+# =========================
+def is_valid_setup(setup):
+    for loss in MEMORY["losses"]:
+        if loss["setup"] == setup:
+            return False
+    return True
 
 # =========================
 # TELEGRAM BOT HANDLERS
@@ -135,27 +144,24 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     chat_id = query.message.chat_id
 
-    # MARKET SELECTION
     if data == "OTC":
         keyboard = [[InlineKeyboardButton(p, callback_data=f"PAIR_{p}")] for p in OTC_PAIRS]
         await query.edit_message_text("OTC Market:", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data == "CRYPTO":
         keyboard = [[InlineKeyboardButton(p, callback_data=f"PAIR_{p}")] for p in CRYPTO_PAIRS]
         await query.edit_message_text("Crypto Market:", reply_markup=InlineKeyboardMarkup(keyboard))
-    # PAIR SELECTION
     elif data.startswith("PAIR_"):
         pair = "_".join(data.split("_")[1:])
         context.user_data["pair"] = pair
         keyboard = [[InlineKeyboardButton(tf, callback_data=f"TF_{tf}")] for tf in TIMEFRAMES]
         await query.edit_message_text(f"{pair} selected.\nSelect timeframe:", reply_markup=InlineKeyboardMarkup(keyboard))
-    # TIMEFRAME SELECTION
     elif data.startswith("TF_"):
         tf = "_".join(data.split("_")[1:])
         pair = context.user_data.get("pair")
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"✅ Pair selected: {pair}\n⏱ Timeframe: {tf}\n⚡ Scanning real market signal..."
+            text=f"✅ Pair selected: {pair}\n⏱ Timeframe: {tf}\n⚡ Scanning..."
         )
         await asyncio.sleep(15)
 
@@ -165,7 +171,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result:
             direction, accuracy, risk, duration, setup = result
 
-            # Save last signal temporarily
+            if not is_valid_setup(setup):
+                await context.bot.send_message(chat_id=chat_id, text="❌ Skipped setup due to previous loss.")
+                return
+
             context.user_data["last_signal"] = {
                 "pair": pair,
                 "timeframe": tf,
@@ -176,7 +185,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "setup": setup
             }
 
-            # Show signal with WIN/LOSS buttons
             keyboard = [
                 [
                     InlineKeyboardButton("WIN ✅", callback_data="WIN"),
@@ -201,21 +209,18 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await context.bot.send_message(chat_id=chat_id, text="❌ Not enough data yet. Try again.")
 
-    # WIN / LOSS HANDLER
     elif data == "WIN":
         last_signal = context.user_data.get("last_signal")
         if last_signal:
             MEMORY["wins"].append(last_signal)
             save_memory()
-            await context.bot.send_message(chat_id=chat_id, text="✅ Win recorded! Memory updated.")
+            await context.bot.send_message(chat_id=chat_id, text="✅ Win recorded! Setup saved.")
     elif data == "LOSS":
         last_signal = context.user_data.get("last_signal")
         if last_signal:
             MEMORY["losses"].append(last_signal)
             save_memory()
             await context.bot.send_message(chat_id=chat_id, text="❌ Loss recorded! Setup discarded.")
-
-    # RESET
     elif data == "RESET":
         keyboard = [[
             InlineKeyboardButton("OTC", callback_data="OTC"),
@@ -233,7 +238,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(buttons))
 
-    # Start websocket task for fast tick collection
     loop = asyncio.get_event_loop()
     loop.create_task(websocket_manager())
 
