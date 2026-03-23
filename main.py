@@ -2,7 +2,7 @@
 # DERIV OTC SIGNAL BOT
 # POCKETOPTION-STYLE (STRICT + REAL ENTRY)
 # FINAL VERSION: MARKET-CONDITION ACCURACY + STABLE LONG TREND DETECTION
-# UPGRADE 1.2: Fast Pullback + Reversal + Real Market Accuracy
+# UPGRADE 1.3: Fast Pullback + Strict Reversal + Real Market Accuracy
 # ======================================
 
 import asyncio
@@ -86,6 +86,33 @@ def detect_pullback(p, direction):
     return False
 
 # ================================
+# STRICT REVERSAL DETECTION
+# ================================
+def detect_reversal(p, current_direction):
+    """
+    Detects strict reversal in trend.
+    Observes both small and large reversals and adapts duration.
+    """
+    if len(p) < 20:
+        return None
+
+    diff = np.diff(p[-10:])
+    reversal_strength = 0
+
+    if current_direction == "BUY":
+        # downward reversal
+        reversal_strength = np.sum(diff < 0)
+        if reversal_strength >= 2 and diff[-1] < 0:
+            return "SELL"  # reversal detected
+    elif current_direction == "SELL":
+        # upward reversal
+        reversal_strength = np.sum(diff > 0)
+        if reversal_strength >= 2 and diff[-1] > 0:
+            return "BUY"  # reversal detected
+
+    return None  # no reversal
+
+# ================================
 # BIG MOVE DETECTION 🔥
 # ================================
 def big_move_ready(p, direction):
@@ -127,7 +154,6 @@ def get_accuracy(p):
         return 85
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
-    # Adapt accuracy dynamically to market volatility
     if std/mean > 0.005:
         return 90
     return 85
@@ -230,8 +256,13 @@ async def monitor():
 
                         # Check for pullback
                         if detect_pullback(prices[pair], direction):
-                            # Wait for pullback to finish before scanning for entry
-                            continue
+                            continue  # wait for pullback to finish
+
+                        # Check for strict reversal
+                        reversal = detect_reversal(prices[pair], direction)
+                        if reversal:
+                            direction = reversal  # adopt reversal direction
+                            # Optional: can pause or adjust tick_confirm if needed
 
                         # tick confirm
                         if tick_confirm[pair]["dir"] == direction:
