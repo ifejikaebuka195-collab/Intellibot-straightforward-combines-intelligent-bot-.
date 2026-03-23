@@ -1,13 +1,12 @@
 # ======================================
-# FINAL REAL-ACCURACY ADAPTIVE BOT
-# WITH GLOBAL SIGNAL LOCK
+# FINAL REAL-ACCURACY ADAPTIVE OTC BOT
+# WITH PERFECT ENTRY TIMING
 # ======================================
 
 import asyncio
 import json
 import requests
 import websockets
-import logging
 import numpy as np
 from datetime import datetime, timedelta
 import pytz
@@ -27,28 +26,30 @@ MAX_MG_STEPS = 3
 EXPIRY_MINUTES = 2
 
 MIN_ACCURACY_REQUIRED = 82
-ROLLING_HISTORY = 50  # Number of recent trades to compute adaptive accuracy
+ROLLING_HISTORY = 50
+CONFIRM_TICKS = 3  # Number of ticks to confirm trend before sending
 
 prices = {}
 trade_history = {}
 pair_settings = {}
 active_signal = {}
-global_signal_lock_until = datetime.min.replace(tzinfo=TIMEZONE)  # Global lock
+global_signal_lock_until = datetime.min.replace(tzinfo=TIMEZONE)
+tick_buffers = {}  # Buffers for entry confirmation
 
 # ---------------- EMA ----------------
 def ema(data, period):
     if len(data) < period:
         return None
-    k = 2/(period+1)
+    k = 2 / (period + 1)
     value = data[0]
     for p in data:
-        value = p*k + value*(1-k)
+        value = p * k + value * (1 - k)
     return value
 
 # ---------------- TREND ----------------
 def analyze(price_list, settings):
     if len(price_list) < 300:
-        return 0,0,None
+        return 0, 0, None
 
     ema_fast = ema(price_list[-50:], settings['fast'])
     ema_slow = ema(price_list[-100:], settings['slow'])
@@ -56,7 +57,7 @@ def analyze(price_list, settings):
     ema_ls = ema(price_list[-300:], settings['ls'])
 
     if not all([ema_fast, ema_slow, ema_lf, ema_ls]):
-        return 0,0,None
+        return 0, 0, None
 
     direction = None
     if ema_fast > ema_slow and ema_lf > ema_ls:
@@ -66,23 +67,20 @@ def analyze(price_list, settings):
 
     volatility = np.std(price_list[-100:])
     separation = abs(ema_fast - ema_slow)
-
     if volatility == 0:
-        return 0,0,None
+        return 0, 0, None
 
-    strength = min(98, (separation/volatility)*100)
+    strength = min(98, (separation / volatility) * 100)
     return strength, strength, direction
 
 # ---------------- ADAPTIVE ACCURACY ----------------
 def get_accuracy(pair):
     history = trade_history.get(pair, deque(maxlen=ROLLING_HISTORY))
     if not history:
-        return 82  # default until enough data
-
-    # Weighted accuracy: recent trades count more
+        return 82
     weights = np.linspace(0.5, 1.5, num=len(history))
-    results = np.array([1 if t=="win" else 0 for t in history])
-    weighted_accuracy = np.sum(results*weights)/np.sum(weights) * 100
+    results = np.array([1 if t == "win" else 0 for t in history])
+    weighted_accuracy = np.sum(results * weights) / np.sum(weights) * 100
     return weighted_accuracy
 
 # ---------------- SIGNAL ----------------
@@ -119,16 +117,16 @@ Strength: {strength:.0f}%
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
 
-    active_signal[pair] = now + timedelta(minutes=10)
-    # Set global lock until this signal expires (entry + expiry)
+    active_signal[pair] = now + timedelta(minutes=EXPIRY_MINUTES)
     global_signal_lock_until = entry_time + timedelta(minutes=EXPIRY_MINUTES)
+    tick_buffers[pair].clear()  # Reset buffer after sending
 
 # ---------------- MONITOR ----------------
 async def monitor():
     global global_signal_lock_until
 
     async with websockets.connect(DERIV_WS) as ws:
-        await ws.send(json.dumps({"active_symbols":"brief"}))
+        await ws.send(json.dumps({"active_symbols": "brief"}))
         res = json.loads(await ws.recv())
 
         symbols = [s["symbol"] for s in res["active_symbols"]
@@ -136,12 +134,13 @@ async def monitor():
 
         for s in symbols:
             prices[s] = []
-            pair_settings[s] = {"fast":10,"slow":20,"lf":30,"ls":60}
+            pair_settings[s] = {"fast": 10, "slow": 20, "lf": 30, "ls": 60}
             trade_history[s] = deque(maxlen=ROLLING_HISTORY)
             active_signal[s] = datetime.min.replace(tzinfo=TIMEZONE)
+            tick_buffers[s] = deque(maxlen=CONFIRM_TICKS)
 
         for s in symbols:
-            await ws.send(json.dumps({"ticks":s,"subscribe":1}))
+            await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
 
         async for msg in ws:
             data = json.loads(msg)
@@ -158,13 +157,16 @@ async def monitor():
             strength, _, direction = analyze(prices[pair], pair_settings[pair])
             accuracy = get_accuracy(pair)
 
-            print(f"{pair} | {price} | Acc:{accuracy:.1f}% | Str:{strength:.1f} | Dir:{direction}")
+            # Add tick to buffer for entry confirmation
+            tick_buffers[pair].append(direction)
 
-            now = datetime.now(TIMEZONE)
-            # Only send if adaptive accuracy is high AND global lock expired
-            if direction and accuracy >= MIN_ACCURACY_REQUIRED and strength >= 85:
-                if now > global_signal_lock_until:
+            # Only trigger if last CONFIRM_TICKS are consistent
+            if direction and len(tick_buffers[pair]) == CONFIRM_TICKS and all(d == direction for d in tick_buffers[pair]):
+                now = datetime.now(TIMEZONE)
+                if accuracy >= MIN_ACCURACY_REQUIRED and strength >= 85 and now > global_signal_lock_until:
                     send_signal(pair, direction, accuracy, strength)
+
+            print(f"{pair} | {price} | Acc:{accuracy:.1f}% | Str:{strength:.1f} | Dir:{direction}")
 
 # ---------------- START ----------------
 asyncio.run(monitor())
