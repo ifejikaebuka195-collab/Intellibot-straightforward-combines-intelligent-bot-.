@@ -59,7 +59,7 @@ async def websocket_manager():
             await asyncio.sleep(3)
 
 # =========================
-# REAL MARKET SIGNAL FILTER (CONTINUOUS TICK-BASED)
+# REAL MARKET SIGNAL FILTER
 # =========================
 def analyze_market(prices, tf):
     if len(prices) < 30:
@@ -69,9 +69,10 @@ def analyze_market(prices, tf):
     momentum = prices[-1] - prices[-5]
     volatility = max(prices) - min(prices)
 
+    # Determine direction using simplified real market filter
     direction = "BUY 🔼" if momentum > 0 else "SELL 🔽"
 
-    # Real accuracy from last 30 ticks
+    # Calculate real accuracy from last 30 ticks
     recent = prices[-30:]
     wins = sum(
         1 for i in range(1, len(recent))
@@ -80,9 +81,10 @@ def analyze_market(prices, tf):
     )
     accuracy = round((wins / len(recent)) * 100)
 
+    # Risk estimate from volatility
     risk = round(volatility / last * 100, 2)
 
-    # Filter only highly profitable signals
+    # Only allow highly filtered signals
     if accuracy < 95:
         return None
 
@@ -132,33 +134,34 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tf = "_".join(data.split("_")[1:])
         pair = context.user_data.get("pair")
 
+        # CLEAR previous message
         await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
         await context.bot.send_message(chat_id=chat_id, text=f"✅ Pair selected: {pair}\n⏱ Timeframe: {tf}\n⚡ Filtering for high-quality signal...")
 
-        # -----------------------------
-        # CONTINUOUS TICK-BASED FILTER LOOP
-        # -----------------------------
-        while True:
-            await asyncio.sleep(15)
-            prices = list(TICKS.get(pair, []))
-            result = analyze_market(prices, tf)
-            if result:
-                direction, accuracy, risk, duration = result
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"📊 SIGNAL RESULT\n\n"
-                        f"Pair: {pair}\n"
-                        f"Timeframe: {tf}\n"
-                        f"Direction: {direction}\n\n"
-                        f"Accuracy: {accuracy}%\n"
-                        f"Risk Level: {risk}%\n"
-                        f"Duration: {duration}\n\n"
-                        f"⚠️ Only send trades above 95% accuracy"
-                    ),
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("RESET", callback_data="RESET")]])
-                )
-                break  # Send only one signal per check
+        # WAIT 15 SECONDS BEFORE SENDING SIGNAL
+        await asyncio.sleep(15)
+
+        prices = list(TICKS.get(pair, []))
+        result = analyze_market(prices, tf)
+
+        if result:
+            direction, accuracy, risk, duration = result
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"📊 SIGNAL RESULT\n\n"
+                    f"Pair: {pair}\n"
+                    f"Timeframe: {tf}\n"
+                    f"Direction: {direction}\n\n"
+                    f"Accuracy: {accuracy}%\n"
+                    f"Risk Level: {risk}%\n"
+                    f"Duration: {duration}\n\n"
+                    f"⚠️ Only send trades above 95% accuracy"
+                ),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("RESET", callback_data="RESET")]])
+            )
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="❌ No highly profitable signal found. Try again.")
 
     elif data == "RESET":
         keyboard = [[InlineKeyboardButton("OTC", callback_data="OTC"),
