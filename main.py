@@ -1,7 +1,7 @@
 # ======================================
-# DERIV OTC SIGNAL BOT - FULL ADAPTIVE SYSTEM
-# POCKETOPTION-STYLE (STRICT + REAL ENTRY + DYNAMIC MARKET ADAPTATION)
-# WORKS DIRECTLY WITH REAL FINANCIAL MARKET
+# DERIV OTC SIGNAL BOT - FULL REFINED
+# POCKETOPTION-STYLE (STRICT + REAL ENTRY)
+# FULL SYSTEM: DYNAMIC ENTRY + ADAPTIVE PULLBACK/REVERSAL + REAL MARKET + VOLATILITY ADJUSTMENT
 # ======================================
 
 import asyncio
@@ -18,10 +18,10 @@ CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
-ENTRY_DELAY_BASE = 1.5  # base minutes before final entry, will adapt dynamically
 EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
 TICK_CONFIRMATION = 3
+COOLDOWN_SECONDS = 15
 
 # ================================
 # BLOCKED PAIRS
@@ -31,10 +31,10 @@ BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 prices = {}
 tick_confirm = {}
 pending_signal = None
-global_lock = None
+cooldown_lock = {}
 
 # ================================
-# EMA CALCULATION
+# EMA
 # ================================
 def ema(data, period):
     if len(data) < period:
@@ -63,34 +63,45 @@ def detect_trend(p):
     return None
 
 # ================================
-# DYNAMIC PULLBACK DETECTION
+# ADAPTIVE VOLATILITY
+# ================================
+def recent_volatility(p):
+    if len(p) < 20:
+        return 0.001
+    return np.std(p[-20:]) / np.mean(p[-20:])
+
+# ================================
+# PULLBACK DETECTION (ADAPTIVE)
 # ================================
 def detect_pullback(p, direction):
     if len(p) < 10:
-        return 0  # pullback length in ticks
+        return False
     recent = np.array(p[-10:])
     diff = np.diff(recent)
-    if direction == "BUY":
-        pullback_ticks = np.sum(diff < 0)
-    else:
-        pullback_ticks = np.sum(diff > 0)
-    return pullback_ticks
+    vol = recent_volatility(p)
+    threshold = max(0.0005, vol * np.mean(recent) * 1.5)
+    if direction == "BUY" and np.any(diff < -threshold):
+        return True
+    if direction == "SELL" and np.any(diff > threshold):
+        return True
+    return False
 
 # ================================
-# DYNAMIC REVERSAL DETECTION
+# REVERSAL DETECTION (ADAPTIVE)
 # ================================
 def detect_reversal(p):
     if len(p) < 15:
-        return None, 0
+        return None
     diff = np.diff(p[-15:])
     ups = np.sum(diff > 0)
     downs = np.sum(diff < 0)
-    strength = max(ups, downs)
-    if ups >= 10 and downs >= 3:
-        return "BUY_REVERSE", strength
-    if downs >= 10 and ups >= 3:
-        return "SELL_REVERSE", strength
-    return None, 0
+    vol = recent_volatility(p)
+    threshold = max(3, int(vol * 50))
+    if ups >= 10 and downs >= threshold:
+        return "BUY_REVERSE"
+    if downs >= 10 and ups >= threshold:
+        return "SELL_REVERSE"
+    return None
 
 # ================================
 # BIG MOVE CHECK
@@ -103,22 +114,16 @@ def big_move_ready(p, direction):
     if std > 0.01 * mean:
         return False
     diff = np.diff(p[-10:])
-    if direction in ["BUY", "BUY_REVERSE"]:
-        return np.sum(diff > 0) >= 8 and all(diff[-3:] > 0)
-    if direction in ["SELL", "SELL_REVERSE"]:
-        return np.sum(diff < 0) >= 8 and all(diff[-3:] < 0)
-    return False
+    if direction == "BUY":
+        if np.sum(diff > 0) < 8 or not (diff[-1] > diff[-2] > diff[-3]):
+            return False
+    if direction == "SELL":
+        if np.sum(diff < 0) < 8 or not (diff[-1] < diff[-2] < diff[-3]):
+            return False
+    return True
 
 # ================================
-# DYNAMIC ENTRY DELAY
-# ================================
-def calculate_entry_delay(pullback_length, reversal_strength):
-    # Base delay adjusted by market signals
-    delay = ENTRY_DELAY_BASE + 0.2 * pullback_length + 0.1 * reversal_strength
-    return max(0.5, delay)  # minimum 0.5 minute
-
-# ================================
-# ENTRY CONFIRMATION
+# ENTRY CONFIRM
 # ================================
 def entry_confirm(p, direction):
     if len(p) < 15:
@@ -131,31 +136,30 @@ def entry_confirm(p, direction):
     return False
 
 # ================================
-# ACCURACY ESTIMATION
+# ACCURACY CALCULATION
 # ================================
 def get_accuracy(p):
     if len(p) < 50:
         return 85
     std = np.std(p[-30:])
     mean = np.mean(p[-30:])
-    # adapt dynamically based on volatility
     if std/mean > 0.005:
         return 90
     return 85
 
 # ================================
-# LOCK MECHANISM
+# COOLDOWN MECHANISM
 # ================================
-def locked():
-    global global_lock
-    return global_lock and datetime.now(TIMEZONE) < global_lock
+def locked(pair):
+    if pair in cooldown_lock:
+        return datetime.now(TIMEZONE) < cooldown_lock[pair]
+    return False
 
-def set_lock(total_delay):
-    global global_lock
-    global_lock = datetime.now(TIMEZONE) + timedelta(minutes=total_delay + EXPIRY_MINUTES)
+def set_lock(pair):
+    cooldown_lock[pair] = datetime.now(TIMEZONE) + timedelta(seconds=COOLDOWN_SECONDS)
 
 # ================================
-# TELEGRAM SIGNALS
+# TELEGRAM MESSAGES
 # ================================
 def send_asset(pair):
     msg = f"""
@@ -169,8 +173,7 @@ Preparing entry...
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
 
-def send_final(pair, direction, acc, entry_delay):
-    entry_time = datetime.now(TIMEZONE) + timedelta(minutes=entry_delay)
+def send_final(pair, direction, acc):
     arrow = "⬆️" if "BUY" in direction else "⬇️"
     msg = f"""
 SIGNAL {arrow}
@@ -179,7 +182,6 @@ Asset: {pair}_otc
 Payout: 92%
 Accuracy: {acc}%
 Expiration: M{EXPIRY_MINUTES}
-Entry Time: {entry_time.strftime('%I:%M %p')}
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
@@ -190,7 +192,7 @@ Entry Time: {entry_time.strftime('%I:%M %p')}
 async def load_symbols():
     try:
         async with websockets.connect(DERIV_WS) as ws:
-            await ws.send(json.dumps({"active_symbols":"brief"}))
+            await ws.send(json.dumps({"active_symbols": "brief"}))
             res = json.loads(await ws.recv())
             return [s["symbol"] for s in res["active_symbols"]
                     if s["symbol"].startswith("frx") and s["symbol"] not in BLOCKED_PAIRS]
@@ -208,26 +210,29 @@ async def monitor():
             if not symbols:
                 await asyncio.sleep(5)
                 continue
+
             for s in symbols:
                 prices[s] = []
-                tick_confirm[s] = {"count":0,"dir":None}
+                tick_confirm[s] = {"count": 0, "dir": None}
 
             async with websockets.connect(DERIV_WS) as ws:
                 for s in symbols:
-                    await ws.send(json.dumps({"ticks":s,"subscribe":1}))
+                    await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
 
                 async for msg in ws:
                     try:
                         data = json.loads(msg)
                         if "tick" not in data:
                             continue
+
                         pair = data["tick"]["symbol"]
                         price = data["tick"]["quote"]
+
                         prices[pair].append(price)
                         if len(prices[pair]) > MAX_PRICES:
                             prices[pair].pop(0)
 
-                        if locked():
+                        if locked(pair):
                             continue
 
                         # Detect trend
@@ -235,9 +240,12 @@ async def monitor():
                         if not direction:
                             continue
 
-                        # Detect pullback and reversal dynamically
-                        pullback_len = detect_pullback(prices[pair], direction)
-                        reversal, rev_strength = detect_reversal(prices[pair])
+                        # Detect pullback
+                        if detect_pullback(prices[pair], direction):
+                            continue
+
+                        # Detect strict reversal
+                        reversal = detect_reversal(prices[pair])
                         if reversal:
                             direction = reversal
 
@@ -245,7 +253,7 @@ async def monitor():
                         if tick_confirm[pair]["dir"] == direction:
                             tick_confirm[pair]["count"] += 1
                         else:
-                            tick_confirm[pair] = {"dir":direction,"count":1}
+                            tick_confirm[pair] = {"dir": direction, "count": 1}
 
                         if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                             continue
@@ -262,15 +270,16 @@ async def monitor():
                             "time": datetime.now(TIMEZONE)
                         }
 
-                        # Dynamic entry delay
-                        entry_delay = calculate_entry_delay(pullback_len, rev_strength)
-                        await asyncio.sleep(entry_delay * 60)
+                        # Adaptive dynamic entry based on volatility
+                        vol = recent_volatility(prices[pair])
+                        dynamic_delay = max(1, min(2, int(vol * 200)))  # scaled for seconds
+                        await asyncio.sleep(dynamic_delay * 60)
 
-                        # Final check before signal
+                        # Final check
                         acc = get_accuracy(prices[pair])
                         if entry_confirm(prices[pair], direction):
-                            send_final(pair, direction, acc, entry_delay)
-                            set_lock(entry_delay)
+                            send_final(pair, direction, acc)
+                            set_lock(pair)
 
                         pending_signal = None
 
