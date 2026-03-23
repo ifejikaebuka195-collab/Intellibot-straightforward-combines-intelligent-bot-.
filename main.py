@@ -1,5 +1,6 @@
 # ======================================
 # FINAL REAL-ACCURACY ADAPTIVE BOT
+# WITH GLOBAL SIGNAL LOCK
 # ======================================
 
 import asyncio
@@ -10,6 +11,7 @@ import logging
 import numpy as np
 from datetime import datetime, timedelta
 import pytz
+from collections import deque
 
 BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
 CHAT_ID = "6918721957"
@@ -25,11 +27,13 @@ MAX_MG_STEPS = 3
 EXPIRY_MINUTES = 2
 
 MIN_ACCURACY_REQUIRED = 82
+ROLLING_HISTORY = 50  # Number of recent trades to compute adaptive accuracy
 
 prices = {}
 trade_history = {}
 pair_settings = {}
 active_signal = {}
+global_signal_lock_until = datetime.min.replace(tzinfo=TIMEZONE)  # Global lock
 
 # ---------------- EMA ----------------
 def ema(data, period):
@@ -69,19 +73,23 @@ def analyze(price_list, settings):
     strength = min(98, (separation/volatility)*100)
     return strength, strength, direction
 
-# ---------------- ACCURACY ----------------
+# ---------------- ADAPTIVE ACCURACY ----------------
 def get_accuracy(pair):
-    history = trade_history.get(pair, [])
-    if len(history) < 20:
+    history = trade_history.get(pair, deque(maxlen=ROLLING_HISTORY))
+    if not history:
         return 82  # default until enough data
 
-    wins = sum(1 for t in history if t == "win")
-    return (wins / len(history)) * 100
+    # Weighted accuracy: recent trades count more
+    weights = np.linspace(0.5, 1.5, num=len(history))
+    results = np.array([1 if t=="win" else 0 for t in history])
+    weighted_accuracy = np.sum(results*weights)/np.sum(weights) * 100
+    return weighted_accuracy
 
 # ---------------- SIGNAL ----------------
 def send_signal(pair, direction, accuracy, strength):
-    now = datetime.now(TIMEZONE)
+    global global_signal_lock_until
 
+    now = datetime.now(TIMEZONE)
     entry_time = now + timedelta(minutes=ENTRY_DELAY_MINUTES)
     mg1 = entry_time + timedelta(minutes=MG_STEP)
     mg2 = mg1 + timedelta(minutes=MG_STEP)
@@ -112,9 +120,13 @@ Strength: {strength:.0f}%
                   data={"chat_id": CHAT_ID, "text": msg})
 
     active_signal[pair] = now + timedelta(minutes=10)
+    # Set global lock until this signal expires (entry + expiry)
+    global_signal_lock_until = entry_time + timedelta(minutes=EXPIRY_MINUTES)
 
-# ---------------- MAIN ----------------
+# ---------------- MONITOR ----------------
 async def monitor():
+    global global_signal_lock_until
+
     async with websockets.connect(DERIV_WS) as ws:
         await ws.send(json.dumps({"active_symbols":"brief"}))
         res = json.loads(await ws.recv())
@@ -125,7 +137,8 @@ async def monitor():
         for s in symbols:
             prices[s] = []
             pair_settings[s] = {"fast":10,"slow":20,"lf":30,"ls":60}
-            trade_history[s] = []
+            trade_history[s] = deque(maxlen=ROLLING_HISTORY)
+            active_signal[s] = datetime.min.replace(tzinfo=TIMEZONE)
 
         for s in symbols:
             await ws.send(json.dumps({"ticks":s,"subscribe":1}))
@@ -147,9 +160,10 @@ async def monitor():
 
             print(f"{pair} | {price} | Acc:{accuracy:.1f}% | Str:{strength:.1f} | Dir:{direction}")
 
-            # Only send if REAL accuracy is high
+            now = datetime.now(TIMEZONE)
+            # Only send if adaptive accuracy is high AND global lock expired
             if direction and accuracy >= MIN_ACCURACY_REQUIRED and strength >= 85:
-                if pair not in active_signal or datetime.now(TIMEZONE) > active_signal[pair]:
+                if now > global_signal_lock_until:
                     send_signal(pair, direction, accuracy, strength)
 
 # ---------------- START ----------------
