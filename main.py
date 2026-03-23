@@ -1,7 +1,7 @@
 # ======================================
 # DERIV OTC SIGNAL BOT - FULL REFINED
 # POCKETOPTION-STYLE (STRICT + REAL ENTRY)
-# FULL SYSTEM: DYNAMIC ENTRY + ADAPTIVE PULLBACK/REVERSAL + REAL MARKET + VOLATILITY ADJUSTMENT
+# FULL SYSTEM: SINGLE TRADE LOCK + DYNAMIC ENTRY + ADAPTIVE PULLBACK/REVERSAL + VOLATILITY ADJUSTMENT
 # ======================================
 
 import asyncio
@@ -21,7 +21,6 @@ TIMEZONE = pytz.timezone("Africa/Lagos")
 EXPIRY_MINUTES = 5
 MAX_PRICES = 5000
 TICK_CONFIRMATION = 3
-COOLDOWN_SECONDS = 15
 
 # ================================
 # BLOCKED PAIRS
@@ -30,6 +29,7 @@ BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
 
 prices = {}
 tick_confirm = {}
+active_trade = None  # Track current active trade pair
 pending_signal = None
 cooldown_lock = {}
 
@@ -156,7 +156,7 @@ def locked(pair):
     return False
 
 def set_lock(pair):
-    cooldown_lock[pair] = datetime.now(TIMEZONE) + timedelta(seconds=COOLDOWN_SECONDS)
+    cooldown_lock[pair] = datetime.now(TIMEZONE) + timedelta(minutes=EXPIRY_MINUTES)
 
 # ================================
 # TELEGRAM MESSAGES
@@ -203,17 +203,20 @@ async def load_symbols():
 # MAIN MONITOR LOOP
 # ================================
 async def monitor():
-    global pending_signal
+    global pending_signal, active_trade
     while True:
         try:
-            symbols = await load_symbols()
-            if not symbols:
-                await asyncio.sleep(5)
-                continue
-
-            for s in symbols:
-                prices[s] = []
-                tick_confirm[s] = {"count": 0, "dir": None}
+            # If there is already an active trade, only monitor that pair
+            if active_trade:
+                symbols = [active_trade]
+            else:
+                symbols = await load_symbols()
+                if not symbols:
+                    await asyncio.sleep(5)
+                    continue
+                for s in symbols:
+                    prices[s] = []
+                    tick_confirm[s] = {"count": 0, "dir": None}
 
             async with websockets.connect(DERIV_WS) as ws:
                 for s in symbols:
@@ -262,6 +265,9 @@ async def monitor():
                         if not big_move_ready(prices[pair], direction):
                             continue
 
+                        # Lock the pair as active trade
+                        active_trade = pair
+
                         # Send preliminary signal
                         send_asset(pair)
                         pending_signal = {
@@ -282,6 +288,7 @@ async def monitor():
                             set_lock(pair)
 
                         pending_signal = None
+                        active_trade = None  # Unlock after trade expires
 
                     except:
                         continue
