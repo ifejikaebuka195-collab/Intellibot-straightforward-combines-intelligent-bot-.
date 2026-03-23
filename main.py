@@ -1,7 +1,7 @@
 # ======================================
 # DERIV OTC SIGNAL BOT - HIGH CONFIDENCE
 # REAL MARKET, SINGLE ENTRY PER PAIR, AUTO EXIT
-# PROBABILITY CONFIDENCE CHECK + DYNAMIC EXIT
+# PROBABILITY CONFIDENCE CHECK + DYNAMIC EXIT + DEBUG STREAM
 # ======================================
 
 import asyncio
@@ -122,7 +122,6 @@ def entry_confirm(p, direction):
 # CONFIDENCE CALCULATION
 # ================================
 def calculate_confidence(p, direction):
-    # trend alignment score
     trend_score = 0
     e1 = ema(p[-20:], 5)
     e2 = ema(p[-50:], 13)
@@ -132,19 +131,29 @@ def calculate_confidence(p, direction):
     elif direction == "SELL" and e1 < e2 < e3:
         trend_score = 50
 
-    # price momentum score
     recent_diff = np.diff(np.array(p[-10:]))
     if direction in ["BUY", "BUY_REVERSE"]:
         momentum_score = min(30, np.sum(recent_diff > 0) * 3)
     else:
         momentum_score = min(30, np.sum(recent_diff < 0) * 3)
 
-    # volatility score
     vol = np.std(p[-20:])
-    vol_score = max(0, 20 - int(vol * 1000))  # lower volatility increases confidence
+    vol_score = max(0, 20 - int(vol * 1000))
 
     total_confidence = trend_score + momentum_score + vol_score
     return total_confidence
+
+# ================================
+# ACCURACY
+# ================================
+def get_accuracy(p):
+    if len(p) < 50:
+        return 85
+    std = np.std(p[-30:])
+    mean = np.mean(p[-30:])
+    if std / mean > 0.005:
+        return 90
+    return 85
 
 # ================================
 # COOLDOWN / LOCK
@@ -170,12 +179,14 @@ Accuracy: {acc}%
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
+    print(f"[SIGNAL SENT] {pair} | {direction} | Duration={duration} | Acc={acc}%")
 
 def send_exit(pair, direction):
     arrow = "🔴 EXIT" if "BUY" in direction else "🔴 EXIT"
     msg = f"Signal closed for {pair}_otc {arrow}"
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
+    print(f"[EXIT SENT] {pair} | {direction}")
 
 # ================================
 # LOAD SYMBOLS
@@ -187,7 +198,8 @@ async def load_symbols():
             res = json.loads(await ws.recv())
             return [s["symbol"] for s in res["active_symbols"]
                     if s["symbol"].startswith("frx") and s["symbol"] not in BLOCKED_PAIRS]
-    except:
+    except Exception as e:
+        print(f"[ERROR] Loading symbols: {e}")
         return []
 
 # ================================
@@ -218,30 +230,26 @@ async def monitor():
 
                         pair = data["tick"]["symbol"]
                         price = data["tick"]["quote"]
-
                         prices[pair].append(price)
                         if len(prices[pair]) > MAX_PRICES:
                             prices[pair].pop(0)
+
+                        # Debug live stream
+                        print(f"[TICK] {pair} | Price={price}")
 
                         # Skip if locked or signal already pending
                         if locked(pair) or pending_signal[pair] is not None:
                             continue
 
-                        # Detect trend
                         direction = detect_trend(prices[pair])
                         if not direction:
                             continue
-
-                        # Detect pullback
                         if detect_pullback(prices[pair], direction):
                             continue
-
-                        # Detect reversal
                         reversal = detect_reversal(prices[pair])
                         if reversal:
                             direction = reversal
 
-                        # Tick confirmation
                         if tick_confirm[pair]["dir"] == direction:
                             tick_confirm[pair]["count"] += 1
                         else:
@@ -249,26 +257,20 @@ async def monitor():
 
                         if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                             continue
-
-                        # Big move check
                         if not big_move_ready(prices[pair], direction):
                             continue
 
-                        # Calculate confidence
                         confidence = calculate_confidence(prices[pair], direction)
                         if confidence < CONFIDENCE_THRESHOLD:
-                            continue  # skip low-confidence signals
+                            continue
 
-                        # Adaptive duration
                         duration = max(1, min(5, int(np.std(prices[pair][-20:])*200)))
                         acc = get_accuracy(prices[pair])
 
-                        # Lock and send signal
                         pending_signal[pair] = {"direction": direction, "start": datetime.now(TIMEZONE)}
                         send_signal(pair, direction, duration, acc)
                         set_cooldown(pair, duration + COOLDOWN_MINUTES)
 
-                        # Auto-exit
                         exit_triggered = False
                         start_time = datetime.now(TIMEZONE)
                         while not exit_triggered:
@@ -286,9 +288,11 @@ async def monitor():
                         pending_signal[pair] = None
                         tick_confirm[pair] = {"count": 0, "dir": None}
 
-                    except:
+                    except Exception as e:
+                        print(f"[ERROR] Processing tick: {e}")
                         continue
-        except:
+        except Exception as e:
+            print(f"[ERROR] Monitor loop: {e}")
             await asyncio.sleep(5)
 
 asyncio.run(monitor())
