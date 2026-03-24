@@ -102,16 +102,22 @@ def extract_features(p):
     }
 
 # -------------------
-# PREDICT
+# PREDICT (FIXED 50% ERROR)
 # -------------------
 
 def predict_probability(p):
     features = extract_features(p)
     if not features:
-        return 0, None
-    prob = model.predict_proba_one(features).get(1, 0.5) * 100
-    direction = "BUY" if prob > 50 else "SELL"
-    return prob, direction
+        return 0, None  # Fixed: Default to 0 instead of 50%
+
+    # Train the model dynamically on incoming ticks
+    direction_label = 1 if p[-1] > p[-2] else 0
+    model.learn_one(features, direction_label)
+
+    # Predict probability
+    prob = model.predict_proba_one(features).get(1, 0) * 100  # Fixed default 0%
+    direction_str = "BUY" if prob > 50 else "SELL"
+    return prob, direction_str
 
 # -------------------
 # MARKET STATE
@@ -182,7 +188,6 @@ async def load_symbols_ws():
         async with websockets.connect(DERIV_WS) as ws:
             await ws.send(json.dumps({"active_symbols": "brief"}))
             res = json.loads(await ws.recv())
-            # Only FRX pairs; arrow pairs removed
             return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx")]
     except:
         return []
@@ -208,7 +213,6 @@ async def monitor():
 
     last_hour_signal = datetime.now() - timedelta(hours=1)
 
-    # ✅ Add 7 popular crypto pairs for tick streaming
     crypto_pairs = ["BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD", "BCHUSD", "ADAUSD", "DOGEUSD"]
 
     while True:
@@ -218,7 +222,6 @@ async def monitor():
                 await asyncio.sleep(5)
                 continue
 
-            # Merge crypto pairs into symbol list
             symbols = list(set(symbols + crypto_pairs))
 
             for s in symbols:
@@ -238,7 +241,6 @@ async def monitor():
 
                         now = datetime.now(TIMEZONE)
 
-                        # ✅ RESET HOUR
                         if now.hour != current_hour:
                             current_hour = now.hour
                             signals_this_hour = 0
@@ -252,8 +254,6 @@ async def monitor():
                         if len(prices[pair]) > MAX_PRICES:
                             prices[pair].pop(0)
 
-                        # -------------------
-                        # ✅ Print ticks on deploy page
                         print(f"[TICK] {pair} = {price}")
 
                         if global_lock:
@@ -307,7 +307,6 @@ async def monitor():
                         asyncio.create_task(unlock_after(expiry_time))
                         last_hour_signal = now
 
-                        # Hourly fallback (original logic preserved)
                         if (datetime.now() - last_hour_signal).seconds > 3600 and not global_lock:
                             top_pair = max(symbol_confidence, key=symbol_confidence.get)
                             top_prices = prices[top_pair]
