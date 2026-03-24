@@ -1,6 +1,6 @@
 # ======================================
 # FULLY UPGRADED REAL-MONEY AI SIGNAL BOT
-# READY FOR DEPLOYMENT
+# READY FOR DEPLOYMENT WITH MARTINGALE
 # ======================================
 
 import asyncio
@@ -25,13 +25,14 @@ TIMEZONE = pytz.timezone("Africa/Lagos")
 
 MAX_PRICES = 5000
 TICK_CONFIRMATION = 3
-COOLDOWN_MINUTES = 2
 PRE_NOTIFY_DELAY = 5
 BASE_CONFIDENCE = 80
 MAX_VOL = 0.008
 MIN_VOL = 0.001
+ENTRY_OFFSET = 2  # minutes ahead for entry
+MARTINGALE_INTERVAL = 2  # minutes between Martingale levels
 
-TRADE_LOG = "ai_real_money_upgraded.csv"
+TRADE_LOG = "ai_real_money_martingale.csv"
 
 # -------------------
 # INIT LOG
@@ -40,8 +41,8 @@ TRADE_LOG = "ai_real_money_upgraded.csv"
 if not os.path.exists(TRADE_LOG):
     with open(TRADE_LOG, "w", newline="") as f:
         csv.writer(f).writerow([
-            "time","pair","dir","entry","confidence","duration_min",
-            "duration_sec","expiry_time","volatility","market_state","result"
+            "time","pair","dir","entry_time","confidence",
+            "expiry_time","volatility","market_state","martingale_level","result"
         ])
 
 # -------------------
@@ -78,7 +79,6 @@ def ema(data, period):
 # -------------------
 
 model = preprocessing.StandardScaler() | linear_model.LogisticRegression()
-# Initialize tiny data to avoid 50% default
 model.learn_one({"returns":0,"volatility":0,"momentum":0,"trend":0,"vol_spike":0}, 0.5)
 model_metric = metrics.LogLoss()
 
@@ -110,7 +110,7 @@ def predict_probability(p, pair=None):
     features = extract_features(p)
     if not features:
         return None, None
-    prob = model.predict_proba_one(features).get(1, 0) * 100  # never default 50%
+    prob = model.predict_proba_one(features).get(1, 0) * 100
     if pair and pair in pair_accuracy:
         prob += pair_accuracy[pair] * 5
         prob = min(max(prob,1), 99.9)
@@ -135,36 +135,51 @@ def market_state(p):
 # TELEGRAM
 # -------------------
 
-def send_pre_notify(pair, direction, duration_min, duration_sec):
+def send_pre_notify(pair, direction, entry_time):
     msg = f"""PRE-NOTIFY: Potential Setup Detected ⏳
 Asset: {pair}
 Direction: {direction}
-Duration: {duration_min} min {duration_sec} sec
+Entry Time: {entry_time.strftime('%H:%M:%S')}
 Waiting {PRE_NOTIFY_DELAY} seconds before final signal..."""
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
-    print(f"[PRE] {pair} {direction}")
+    print(f"[PRE] {pair} {direction} Entry at {entry_time.strftime('%H:%M:%S')}")
 
-def send_final_signal(pair, direction, confidence, duration_min, duration_sec, expiry_time):
-    msg = f"""AI SIGNAL ✅
+def send_final_signal(pair, direction, confidence, entry_time, expiry_time):
+    # Calculate Martingale levels
+    m1 = entry_time + timedelta(minutes=MARTINGALE_INTERVAL)
+    m2 = m1 + timedelta(minutes=MARTINGALE_INTERVAL)
+    m3 = m2 + timedelta(minutes=MARTINGALE_INTERVAL)
+
+    msg = f"""🚨TRADE NOW!!
+
 Asset: {pair}
+Entry Time: {entry_time.strftime('%H:%M:%S')}
 Direction: {direction}
+Expiry: {expiry_time.strftime('%H:%M:%S')}
 Confidence: {confidence:.2f}%
-Duration: {duration_min} min {duration_sec} sec
-Expiry Time: {expiry_time.strftime('%H:%M:%S')}"""
+
+🎯 Martingale Levels:
+🔁 Level 1 → {m1.strftime('%H:%M:%S')}
+🔁 Level 2 → {m2.strftime('%H:%M:%S')}
+🔁 Level 3 → {m3.strftime('%H:%M:%S')}"""
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
-    print(f"[SIGNAL] {pair} {direction} {confidence:.2f}%")
+    print(f"[SIGNAL] {pair} {direction} Entry {entry_time.strftime('%H:%M:%S')}")
+
+    # Log all levels
+    for level, t in enumerate([entry_time, m1, m2, m3]):
+        log_signal(pair, direction, t, confidence, expiry_time, np.std(prices[pair][-20:]), market_state(prices[pair]), level+1)
 
 # -------------------
 # LOGGING
 # -------------------
 
-def log_signal(pair, direction, entry, confidence, duration_min, duration_sec, expiry_time, vol, state, result="PENDING"):
+def log_signal(pair, direction, entry_time, confidence, expiry_time, vol, state, martingale_level, result="PENDING"):
     with open(TRADE_LOG, "a", newline="") as f:
         csv.writer(f).writerow([
-            datetime.now(TIMEZONE), pair, direction, entry, confidence,
-            duration_min, duration_sec, expiry_time.strftime('%H:%M:%S'), vol, state, result
+            datetime.now(TIMEZONE), pair, direction, entry_time.strftime('%H:%M:%S'), confidence,
+            expiry_time.strftime('%H:%M:%S'), vol, state, martingale_level, result
         ])
 
 # -------------------
@@ -227,14 +242,7 @@ async def load_symbols_ws():
 # -------------------
 
 def dynamic_expiry_seconds(volatility):
-    if volatility < 0.002:
-        return 240
-    elif volatility < 0.003:
-        return 180
-    elif volatility < 0.005:
-        return 120
-    else:
-        return 90
+    return 120  # fixed 2 minutes for real-money trading
 
 # -------------------
 # MAIN LOOP
@@ -305,26 +313,22 @@ async def monitor():
                         if pair == last_pair_sent:
                             continue
 
-                        vol = np.std(prices[pair][-20:])
-                        total_seconds = dynamic_expiry_seconds(vol)
-                        duration_min = total_seconds // 60
-                        duration_sec = total_seconds % 60
-                        expiry_time = now + timedelta(seconds=total_seconds)
+                        # Calculate entry time 2 minutes ahead
+                        entry_time = now + timedelta(minutes=ENTRY_OFFSET)
+                        expiry_time = entry_time + timedelta(seconds=dynamic_expiry_seconds(np.std(prices[pair][-20:])))
 
-                        send_pre_notify(pair,direction,duration_min,duration_sec)
+                        # Pre-notify
+                        send_pre_notify(pair, direction, entry_time)
                         await asyncio.sleep(PRE_NOTIFY_DELAY)
 
-                        entry = prices[pair][-1]
-
-                        send_final_signal(pair,direction,prob,duration_min,duration_sec,expiry_time)
-                        log_signal(pair,direction,entry,prob,duration_min,duration_sec,expiry_time,vol,state)
+                        # Final signal
+                        send_final_signal(pair, direction, prob, entry_time, expiry_time)
 
                         signals_this_hour += 1
                         last_pair_sent = pair
-
                         global_lock = True
                         cooldowns[pair] = expiry_time + timedelta(seconds=1)
-                        asyncio.create_task(unlock_after(expiry_time,pair,entry,direction))
+                        asyncio.create_task(unlock_after(expiry_time, pair, prices[pair][-1], direction))
 
                     except Exception as e:
                         print("[ERROR] Tick:",e)
