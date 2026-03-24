@@ -24,7 +24,6 @@ TIMEZONE = pytz.timezone("Africa/Lagos")
 
 MAX_PRICES = 5000
 TICK_CONFIRMATION = 3
-PRE_NOTIFY_DELAY = 5
 BASE_CONFIDENCE = 80
 MAX_SIGNALS_PER_HOUR = 2
 
@@ -36,7 +35,7 @@ TRADE_LOG = "ai_no_martingale_signals.csv"
 if not os.path.exists(TRADE_LOG):
     with open(TRADE_LOG, "w", newline="") as f:
         csv.writer(f).writerow([
-            "time","pair","direction","entry","confidence","duration_min",
+            "time","pair","direction","confidence","duration_min",
             "duration_sec","expiry_time","volatility","market_state","result"
         ])
 
@@ -45,7 +44,6 @@ if not os.path.exists(TRADE_LOG):
 # -------------------
 prices = {}
 tick_confirm = {}
-cooldowns = {}
 symbol_confidence = {}
 global_lock = False
 signals_this_hour = 0
@@ -91,7 +89,7 @@ def predict_direction(p):
     if not features:
         return 0, None
     trend_score = features["returns"] + features["momentum"] * 0.5
-    prob = min(max((trend_score + 0.5) * 100, 1), 99)  # Scale 0-100%
+    prob = min(max((trend_score + 0.5) * 100, 1), 99)
     direction = "BUY" if prob > 50 else "SELL"
     return prob, direction
 
@@ -116,28 +114,21 @@ def market_state(p):
 def format_signal(pair, direction, confidence, duration_min, duration_sec, volatility):
     arrow = "↗️" if direction == "BUY" else "↘️"
     signal_text = f"""🖇 Signal information:
-       {pair} — {duration_min} minutes
+{pair} — {duration_min} minutes
 
 📰 Market Setting:
-       Info context: None
-       Volatility: {'Low' if volatility<0.002 else 'Moderate' if volatility<0.004 else 'High'}
-       
+Info context: None
+Volatility: {'Moderate' if volatility<0.004 else 'High'}
+
 🖥 Technical overview:
-       Only for stock quotes
+Only for stock quotes
 
 💷 Probabilities:
-       Signal reliability: {confidence:.2f}%
+Signal reliability: {confidence:.2f}%
 
 🧨 Bot signal:
-       {direction} {arrow}"""
+{direction} {arrow}"""
     return signal_text
-
-def send_pre_notify(pair, direction, duration_min, duration_sec, confidence, volatility):
-    msg = format_signal(pair, direction, confidence, duration_min, duration_sec, volatility)
-    msg = f"PRE-NOTIFY: Potential Setup Detected ⏳\n{msg}\nWaiting {PRE_NOTIFY_DELAY} seconds before final signal..."
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                  data={"chat_id": CHAT_ID, "text": msg})
-    print(f"[PRE] {pair} {direction} {confidence:.2f}%")
 
 def send_final_signal(pair, direction, confidence, duration_min, duration_sec, expiry_time, volatility):
     msg = format_signal(pair, direction, confidence, duration_min, duration_sec, volatility)
@@ -149,10 +140,10 @@ def send_final_signal(pair, direction, confidence, duration_min, duration_sec, e
 # -------------------
 # LOGGING
 # -------------------
-def log_signal(pair, direction, entry, confidence, duration_min, duration_sec, expiry_time, vol, state, result="PENDING"):
+def log_signal(pair, direction, confidence, duration_min, duration_sec, expiry_time, vol, state, result="PENDING"):
     with open(TRADE_LOG, "a", newline="") as f:
         csv.writer(f).writerow([
-            datetime.now(TIMEZONE), pair, direction, entry, confidence,
+            datetime.now(TIMEZONE), pair, direction, confidence,
             duration_min, duration_sec, expiry_time.strftime('%H:%M:%S'), vol, state, result
         ])
 
@@ -164,17 +155,6 @@ async def unlock_after(expiry_time):
     delay = (expiry_time - datetime.now(TIMEZONE)).total_seconds()
     await asyncio.sleep(max(0, delay))
     global_lock = False
-
-# -------------------
-# DYNAMIC EXPIRY
-# -------------------
-def dynamic_expiry_seconds(volatility):
-    if volatility < 0.002:
-        return 180
-    elif volatility < 0.004:
-        return 120
-    else:
-        return 75
 
 # -------------------
 # MAIN LOOP
@@ -215,6 +195,9 @@ async def monitor():
                         pair = data["tick"]["symbol"]
                         price = data["tick"]["quote"]
 
+                        # DEBUG: Show all ticks
+                        print(f"[TICK] {pair} = {price}")
+
                         prices[pair].append(price)
                         if len(prices[pair]) > MAX_PRICES:
                             prices[pair].pop(0)
@@ -226,8 +209,9 @@ async def monitor():
                         if pair in tick_confirm and now < tick_confirm[pair].get("cooldown", now):
                             continue
 
-                        state = market_state(prices[pair])
-                        if state != "NORMAL":
+                        vol = np.std(prices[pair][-20:])
+                        # Only allow medium or high volatility
+                        if vol < 0.002:
                             continue
 
                         prob, direction = predict_direction(prices[pair])
@@ -246,19 +230,16 @@ async def monitor():
                         if pair == last_pair_sent:
                             continue
 
-                        vol = np.std(prices[pair][-20:])
-                        total_seconds = dynamic_expiry_seconds(vol)
-                        duration_min = total_seconds // 60
-                        duration_sec = total_seconds % 60
-                        expiry_time = now + timedelta(seconds=total_seconds)
+                        # Enforce strict 2-minute duration
+                        duration_min = 2
+                        duration_sec = 0
+                        expiry_time = now + timedelta(minutes=2)
 
-                        send_pre_notify(pair, direction, duration_min, duration_sec, prob, vol)
-                        await asyncio.sleep(PRE_NOTIFY_DELAY)
-
-                        entry = prices[pair][-1]
+                        # DEBUG: Signal about to trigger
+                        print(f"[READY SIGNAL] {pair} {direction} prob={prob:.2f}% vol={vol:.5f}")
 
                         send_final_signal(pair, direction, prob, duration_min, duration_sec, expiry_time, vol)
-                        log_signal(pair, direction, entry, prob, duration_min, duration_sec, expiry_time, vol, state)
+                        log_signal(pair, direction, prob, duration_min, duration_sec, expiry_time, vol, "NORMAL")
 
                         signals_this_hour += 1
                         last_pair_sent = pair
