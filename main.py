@@ -1,7 +1,6 @@
 # ======================================
-# DERIV OTC SIGNAL BOT - HIGH CONFIDENCE
-# REAL MARKET, SINGLE ENTRY PER PAIR, AUTO EXIT
-# PROBABILITY CONFIDENCE CHECK + DYNAMIC EXIT + DEBUG STREAM
+# DERIV AI SIGNAL BOT - FULL LIVE ADAPTIVE
+# REAL MARKET + SELF-LEARNING + STABLE
 # ======================================
 
 import asyncio
@@ -11,28 +10,39 @@ import websockets
 import numpy as np
 from datetime import datetime, timedelta
 import pytz
+import os
+import csv
+from river import linear_model, preprocessing, metrics
 
+# --------------------------
+# CONFIG
+# --------------------------
 BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
 CHAT_ID = "6918721957"
-
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
 MAX_PRICES = 5000
-TICK_CONFIRMATION = 3
+TICK_CONFIRMATION = 2
 COOLDOWN_MINUTES = 2
-CONFIDENCE_THRESHOLD = 90  # minimum % probability to send signal
-
-BLOCKED_PAIRS = ["frxUSDNOK","frxGBPNOK","frxUSDPLN","frxGBPNZD","frxUSDSEK"]
+CONFIDENCE_THRESHOLD = 85
 
 prices = {}
 tick_confirm = {}
-pending_signal = {}
 cooldowns = {}
+pending = {}
+TRADE_LOG = "ai_trades.csv"
 
-# ================================
-# EMA UTILITY
-# ================================
+# --------------------------
+# INIT LOG
+# --------------------------
+if not os.path.exists(TRADE_LOG):
+    with open(TRADE_LOG, "w", newline="") as f:
+        csv.writer(f).writerow(["time","pair","dir","entry","exit","result"])
+
+# --------------------------
+# EMA
+# --------------------------
 def ema(data, period):
     if len(data) < period:
         return None
@@ -42,169 +52,86 @@ def ema(data, period):
         val = p * k + val * (1 - k)
     return val
 
-# ================================
-# TREND DETECTION
-# ================================
-def detect_trend(p):
-    if len(p) < 100:
+# --------------------------
+# FEATURE EXTRACTION
+# --------------------------
+def extract_features(p):
+    if len(p) < 30:
         return None
-    e1 = ema(p[-20:], 5)
-    e2 = ema(p[-50:], 13)
-    e3 = ema(p[-100:], 21)
-    if not all([e1, e2, e3]):
-        return None
-    if e1 > e2 > e3:
-        return "BUY"
-    elif e1 < e2 < e3:
-        return "SELL"
-    return None
+    returns = (p[-1] - p[-2]) / p[-2]
+    volatility = np.std(p[-20:])
+    momentum = np.sum(np.diff(p[-10:]))
+    trend_strength = abs(ema(p[-20:],5) - ema(p[-50:],13))
+    return {
+        "returns": returns,
+        "volatility": volatility,
+        "momentum": momentum,
+        "trend_strength": trend_strength
+    }
 
-# ================================
-# PULLBACK DETECTION
-# ================================
-def detect_pullback(p, direction):
-    window = min(15, len(p))
-    recent = np.array(p[-window:])
-    diff = np.diff(recent)
-    if direction == "BUY" and np.any(diff < 0):
-        return True
-    if direction == "SELL" and np.any(diff > 0):
-        return True
-    return False
+# --------------------------
+# ONLINE ML MODEL
+# --------------------------
+model = preprocessing.StandardScaler() | linear_model.LogisticRegression()
+accuracy_metric = metrics.Accuracy()
 
-# ================================
-# REVERSAL DETECTION
-# ================================
-def detect_reversal(p):
-    window = min(20, len(p))
-    diff = np.diff(np.array(p[-window:]))
-    ups = np.sum(diff > 0)
-    downs = np.sum(diff < 0)
-    if ups >= 10 and downs >= 3:
-        return "BUY_REVERSE"
-    if downs >= 10 and ups >= 3:
-        return "SELL_REVERSE"
-    return None
-
-# ================================
-# BIG MOVE CHECK
-# ================================
-def big_move_ready(p, direction):
-    if len(p) < 50:
-        return False
-    std = np.std(p[-30:])
-    mean = np.mean(p[-30:])
-    if std > 0.01 * mean:
-        return False
-    diff = np.diff(p[-10:])
-    if direction in ["BUY", "BUY_REVERSE"]:
-        if np.sum(diff > 0) < 8 or not (diff[-1] > diff[-2] > diff[-3]):
-            return False
-    if direction in ["SELL", "SELL_REVERSE"]:
-        if np.sum(diff < 0) < 8 or not (diff[-1] < diff[-2] < diff[-3]):
-            return False
-    return True
-
-# ================================
-# ENTRY CONFIRMATION
-# ================================
-def entry_confirm(p, direction):
-    if len(p) < 15:
-        return False
-    diff = np.diff(p[-10:])
-    if direction in ["BUY", "BUY_REVERSE"]:
-        return np.sum(diff > 0) >= 8
-    if direction in ["SELL", "SELL_REVERSE"]:
-        return np.sum(diff < 0) >= 8
-    return False
-
-# ================================
-# CONFIDENCE CALCULATION
-# ================================
-def calculate_confidence(p, direction):
-    trend_score = 0
-    e1 = ema(p[-20:], 5)
-    e2 = ema(p[-50:], 13)
-    e3 = ema(p[-100:], 21)
-    if direction == "BUY" and e1 > e2 > e3:
-        trend_score = 50
-    elif direction == "SELL" and e1 < e2 < e3:
-        trend_score = 50
-
-    recent_diff = np.diff(np.array(p[-10:]))
-    if direction in ["BUY", "BUY_REVERSE"]:
-        momentum_score = min(30, np.sum(recent_diff > 0) * 3)
-    else:
-        momentum_score = min(30, np.sum(recent_diff < 0) * 3)
-
+# --------------------------
+# MARKET STATE
+# --------------------------
+def market_state(p):
+    if len(p) < 20:
+        return "UNKNOWN"
     vol = np.std(p[-20:])
-    vol_score = max(0, 20 - int(vol * 1000))
+    if vol < 0.001:
+        return "RANGE"
+    elif vol > 0.005:
+        return "VOLATILE"
+    return "NORMAL"
 
-    total_confidence = trend_score + momentum_score + vol_score
-    return total_confidence
-
-# ================================
-# ACCURACY
-# ================================
-def get_accuracy(p):
-    if len(p) < 50:
-        return 85
-    std = np.std(p[-30:])
-    mean = np.mean(p[-30:])
-    if std / mean > 0.005:
-        return 90
-    return 85
-
-# ================================
-# COOLDOWN / LOCK
-# ================================
-def locked(pair):
-    return pair in cooldowns and datetime.now(TIMEZONE) < cooldowns[pair]
-
-def set_cooldown(pair, minutes):
-    cooldowns[pair] = datetime.now(TIMEZONE) + timedelta(minutes=minutes)
-
-# ================================
-# TELEGRAM SIGNALS
-# ================================
-def send_signal(pair, direction, duration, acc):
-    arrow = "⬆️" if "BUY" in direction else "⬇️"
+# --------------------------
+# TELEGRAM
+# --------------------------
+def send_notification(pair, direction, prob, stage="ENTRY"):
+    arrow = "⬆️" if direction=="BUY" else "⬇️"
     msg = f"""
-SIGNAL {arrow}
+AI SIGNAL [{stage}]
 
 Asset: {pair}_otc
-Duration: {duration} min
-Payout: 92%
-Accuracy: {acc}%
+Direction: {direction}
+Confidence: {prob}%
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
-    print(f"[SIGNAL SENT] {pair} | {direction} | Duration={duration} | Acc={acc}%")
 
-def send_exit(pair, direction):
-    arrow = "🔴 EXIT" if "BUY" in direction else "🔴 EXIT"
-    msg = f"Signal closed for {pair}_otc {arrow}"
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                  data={"chat_id": CHAT_ID, "text": msg})
-    print(f"[EXIT SENT] {pair} | {direction}")
+# --------------------------
+# LOGGING
+# --------------------------
+def log_trade(pair, direction, entry, exit_price):
+    result = "WIN" if (
+        (direction == "BUY" and exit_price > entry) or
+        (direction == "SELL" and exit_price < entry)
+    ) else "LOSS"
 
-# ================================
+    with open(TRADE_LOG, "a", newline="") as f:
+        csv.writer(f).writerow([
+            datetime.now(TIMEZONE), pair, direction, entry, exit_price, result
+        ])
+
+# --------------------------
 # LOAD SYMBOLS
-# ================================
+# --------------------------
 async def load_symbols():
     try:
         async with websockets.connect(DERIV_WS) as ws:
             await ws.send(json.dumps({"active_symbols": "brief"}))
             res = json.loads(await ws.recv())
-            return [s["symbol"] for s in res["active_symbols"]
-                    if s["symbol"].startswith("frx") and s["symbol"] not in BLOCKED_PAIRS]
-    except Exception as e:
-        print(f"[ERROR] Loading symbols: {e}")
+            return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx")]
+    except:
         return []
 
-# ================================
+# --------------------------
 # MAIN MONITOR LOOP
-# ================================
+# --------------------------
 async def monitor():
     while True:
         try:
@@ -215,8 +142,7 @@ async def monitor():
 
             for s in symbols:
                 prices[s] = []
-                tick_confirm[s] = {"count": 0, "dir": None}
-                pending_signal[s] = None
+                tick_confirm[s] = {"count":0, "dir":None}
 
             async with websockets.connect(DERIV_WS) as ws:
                 for s in symbols:
@@ -227,72 +153,64 @@ async def monitor():
                         data = json.loads(msg)
                         if "tick" not in data:
                             continue
-
                         pair = data["tick"]["symbol"]
                         price = data["tick"]["quote"]
                         prices[pair].append(price)
                         if len(prices[pair]) > MAX_PRICES:
                             prices[pair].pop(0)
+                        print(f"[LIVE] {pair} {price}")
 
-                        # Debug live stream
-                        print(f"[TICK] {pair} | Price={price}")
-
-                        # Skip if locked or signal already pending
-                        if locked(pair) or pending_signal[pair] is not None:
+                        if pair in cooldowns and datetime.now(TIMEZONE) < cooldowns[pair]:
                             continue
 
-                        direction = detect_trend(prices[pair])
-                        if not direction:
+                        state = market_state(prices[pair])
+                        if state != "NORMAL":
                             continue
-                        if detect_pullback(prices[pair], direction):
-                            continue
-                        reversal = detect_reversal(prices[pair])
-                        if reversal:
-                            direction = reversal
 
+                        # FEATURE EXTRACTION
+                        features = extract_features(prices[pair])
+                        if not features:
+                            continue
+
+                        # PREDICTION
+                        x = features
+                        prob = model.predict_proba_one(x).get("BUY",0)*100
+                        direction = "BUY" if prob >= 50 else "SELL"
+
+                        # TICK CONFIRMATION
                         if tick_confirm[pair]["dir"] == direction:
                             tick_confirm[pair]["count"] += 1
                         else:
-                            tick_confirm[pair] = {"dir": direction, "count": 1}
-
+                            tick_confirm[pair] = {"dir":direction,"count":1}
                         if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                             continue
-                        if not big_move_ready(prices[pair], direction):
+
+                        # HIGH CONFIDENCE CHECK
+                        if prob < CONFIDENCE_THRESHOLD:
                             continue
 
-                        confidence = calculate_confidence(prices[pair], direction)
-                        if confidence < CONFIDENCE_THRESHOLD:
-                            continue
+                        entry = prices[pair][-1]
+                        send_notification(pair, direction, prob, stage="PRE-ENTRY")
+                        await asyncio.sleep(1)  # small delay before sending actual signal
+                        send_notification(pair, direction, prob, stage="ENTRY")
 
-                        duration = max(1, min(5, int(np.std(prices[pair][-20:])*200)))
-                        acc = get_accuracy(prices[pair])
+                        cooldowns[pair] = datetime.now(TIMEZONE) + timedelta(minutes=COOLDOWN_MINUTES)
 
-                        pending_signal[pair] = {"direction": direction, "start": datetime.now(TIMEZONE)}
-                        send_signal(pair, direction, duration, acc)
-                        set_cooldown(pair, duration + COOLDOWN_MINUTES)
+                        # WAIT FOR EXIT (1 min)
+                        await asyncio.sleep(60)
+                        exit_price = prices[pair][-1]
+                        log_trade(pair, direction, entry, exit_price)
 
-                        exit_triggered = False
-                        start_time = datetime.now(TIMEZONE)
-                        while not exit_triggered:
-                            await asyncio.sleep(1)
-                            if len(prices[pair]) < 5:
-                                continue
-                            current_trend = detect_trend(prices[pair])
-                            if current_trend != direction:
-                                exit_triggered = True
-                                send_exit(pair, direction)
-                            elif (datetime.now(TIMEZONE) - start_time).seconds / 60 >= duration:
-                                exit_triggered = True
-                                send_exit(pair, direction)
-
-                        pending_signal[pair] = None
-                        tick_confirm[pair] = {"count": 0, "dir": None}
+                        # UPDATE MODEL
+                        y = 1 if (direction=="BUY" and exit_price>entry) or (direction=="SELL" and exit_price<entry) else 0
+                        model.learn_one(features, "BUY" if y==1 else "SELL")
+                        accuracy_metric.update("BUY" if y==1 else "SELL", direction)
 
                     except Exception as e:
-                        print(f"[ERROR] Processing tick: {e}")
-                        continue
+                        print("Tick Error:", e)
+
         except Exception as e:
-            print(f"[ERROR] Monitor loop: {e}")
+            print("Main Loop Error:", e)
             await asyncio.sleep(5)
 
 asyncio.run(monitor())
