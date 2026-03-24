@@ -1,6 +1,6 @@
 # ======================================
 # FINAL REAL-MONEY OPTIONS AI SIGNAL BOT
-# FULLY OPTIMIZED FOR MAX PROFITABILITY
+# FULLY OPTIMIZED FOR MAX PROFITABILITY WITH LEARNING FIX
 # ======================================
 
 import asyncio
@@ -183,18 +183,13 @@ def update_pair_accuracy(pair, entry, exit_price, direction):
     return result
 
 # -------------------
-# ✅ FIXED MODEL LEARNING
+# TRAIN MODEL WITH POST-EXPIRY PRICE
 # -------------------
 
-def train_model(pair, entry, direction):
-    if pair not in prices or len(prices[pair]) < 30:
-        return
-
+def train_model(pair, entry, exit_price, direction):
     features = extract_features(prices[pair])
     if not features:
         return
-
-    exit_price = prices[pair][-1]
 
     if direction == "BUY":
         label = 1 if exit_price > entry else 0
@@ -215,7 +210,7 @@ async def unlock_after(expiry_time, pair=None, entry=None, direction=None):
     if pair and entry is not None and direction is not None:
         exit_price = prices[pair][-1] if prices[pair] else entry
         update_pair_accuracy(pair, entry, exit_price, direction)
-        train_model(pair, entry, direction)
+        train_model(pair, entry, exit_price, direction)
 
     global_lock = False
 
@@ -254,8 +249,7 @@ async def monitor():
     global global_lock, signals_this_hour, current_hour, last_pair_sent
 
     last_hour_signal = datetime.now() - timedelta(hours=1)
-
-    crypto_pairs = ["BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD", "BCHUSD", "ADAUSD", "DOGEUSD"]
+    crypto_pairs = ["BTCUSD","ETHUSD","LTCUSD","XRPUSD","BCHUSD","ADAUSD","DOGEUSD"]
 
     while True:
         try:
@@ -268,13 +262,13 @@ async def monitor():
 
             for s in symbols:
                 prices[s] = []
-                tick_confirm[s] = {"count": 0, "dir": None}
+                tick_confirm[s] = {"count":0,"dir":None}
                 symbol_confidence[s] = BASE_CONFIDENCE
                 pair_accuracy[s] = 0
 
             async with websockets.connect(DERIV_WS) as ws:
                 for s in symbols:
-                    await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
+                    await ws.send(json.dumps({"ticks": s,"subscribe": 1}))
 
                 async for msg in ws:
                     try:
@@ -283,7 +277,6 @@ async def monitor():
                             continue
 
                         now = datetime.now(TIMEZONE)
-
                         if now.hour != current_hour:
                             current_hour = now.hour
                             signals_this_hour = 0
@@ -308,8 +301,7 @@ async def monitor():
                         if state != "NORMAL":
                             continue
 
-                        prob, direction = predict_probability(prices[pair], pair)
-
+                        prob,direction = predict_probability(prices[pair], pair)
                         print(f"[READY] {pair} {direction} {prob:.2f}%")
 
                         if prob < symbol_confidence[pair]:
@@ -318,7 +310,7 @@ async def monitor():
                         if tick_confirm[pair]["dir"] == direction:
                             tick_confirm[pair]["count"] += 1
                         else:
-                            tick_confirm[pair] = {"dir": direction, "count": 1}
+                            tick_confirm[pair] = {"dir":direction,"count":1}
 
                         if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                             continue
@@ -331,26 +323,26 @@ async def monitor():
                         duration_sec = total_seconds % 60
                         expiry_time = now + timedelta(seconds=total_seconds)
 
-                        send_pre_notify(pair, direction, duration_min, duration_sec)
+                        send_pre_notify(pair,direction,duration_min,duration_sec)
                         await asyncio.sleep(PRE_NOTIFY_DELAY)
 
                         entry = prices[pair][-1]
 
-                        send_final_signal(pair, direction, prob, duration_min, duration_sec, expiry_time)
-                        log_signal(pair, direction, entry, prob, duration_min, duration_sec, expiry_time, vol, state)
+                        send_final_signal(pair,direction,prob,duration_min,duration_sec,expiry_time)
+                        log_signal(pair,direction,entry,prob,duration_min,duration_sec,expiry_time,vol,state)
 
                         signals_this_hour += 1
                         last_pair_sent = pair
 
                         global_lock = True
                         cooldowns[pair] = expiry_time + timedelta(seconds=1)
-                        asyncio.create_task(unlock_after(expiry_time, pair, entry, direction))
+                        asyncio.create_task(unlock_after(expiry_time,pair,entry,direction))
                         last_hour_signal = now
 
                     except Exception as e:
-                        print("[ERROR] Tick:", e)
+                        print("[ERROR] Tick:",e)
         except Exception as e:
-            print("[ERROR] Main:", e)
+            print("[ERROR] Main:",e)
             await asyncio.sleep(5)
 
 # -------------------
