@@ -2,4 +2,4 @@ numpy
 requests
 websockets
 pytz
-river
+river==0.22.0  # This version has prebuilt wheels
