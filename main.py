@@ -53,6 +53,7 @@ tick_confirm = {}
 cooldowns = {}
 pending_signal = {}
 symbol_confidence = {}
+pair_accuracy = {}  # ✅ New: track each pair's historical success
 global_lock = False
 
 # ✅ ADDED CONTROLS
@@ -102,22 +103,22 @@ def extract_features(p):
     }
 
 # -------------------
-# PREDICT (FIXED 50% ERROR)
+# PREDICT
 # -------------------
 
-def predict_probability(p):
+def predict_probability(p, pair=None):
     features = extract_features(p)
     if not features:
-        return 0, None  # Fixed: Default to 0 instead of 50%
+        return 0, None
+    prob = model.predict_proba_one(features).get(1, 0.5) * 100
 
-    # Train the model dynamically on incoming ticks
-    direction_label = 1 if p[-1] > p[-2] else 0
-    model.learn_one(features, direction_label)
-
-    # Predict probability
-    prob = model.predict_proba_one(features).get(1, 0) * 100  # Fixed default 0%
-    direction_str = "BUY" if prob > 50 else "SELL"
-    return prob, direction_str
+    # ✅ Adjust confidence dynamically by historical performance
+    if pair and pair in pair_accuracy:
+        prob += pair_accuracy[pair] * 5  # boost high-performing pairs
+        prob = min(prob, 99.9)  # cap at 99.9%
+    
+    direction = "BUY" if prob > 50 else "SELL"
+    return prob, direction
 
 # -------------------
 # MARKET STATE
@@ -170,13 +171,32 @@ def log_signal(pair, direction, entry, confidence, duration_min, duration_sec, e
         ])
 
 # -------------------
+# POST-SIGNAL PERFORMANCE UPDATE
+# -------------------
+
+def update_pair_accuracy(pair, entry, exit_price, direction):
+    # Simple calculation: +1 if correct, -1 if wrong
+    if direction == "BUY":
+        result = 1 if exit_price > entry else -1
+    else:
+        result = 1 if exit_price < entry else -1
+    if pair not in pair_accuracy:
+        pair_accuracy[pair] = 0
+    pair_accuracy[pair] = max(min(pair_accuracy[pair] + result, 5), -5)  # cap performance score
+    return result
+
+# -------------------
 # UNLOCK
 # -------------------
 
-async def unlock_after(expiry_time):
+async def unlock_after(expiry_time, pair=None, entry=None, direction=None):
     global global_lock
     delay = (expiry_time - datetime.now(TIMEZONE)).total_seconds()
     await asyncio.sleep(max(0, delay))
+    # ✅ Update pair performance on expiry
+    if pair and entry is not None and direction is not None:
+        exit_price = prices[pair][-1] if prices[pair] else entry
+        update_pair_accuracy(pair, entry, exit_price, direction)
     global_lock = False
 
 # -------------------
@@ -198,11 +218,13 @@ async def load_symbols_ws():
 
 def dynamic_expiry_seconds(volatility):
     if volatility < 0.002:
+        return 240
+    elif volatility < 0.003:
         return 180
-    elif volatility < 0.004:
+    elif volatility < 0.005:
         return 120
     else:
-        return 75
+        return 90
 
 # -------------------
 # MAIN LOOP
@@ -228,6 +250,7 @@ async def monitor():
                 prices[s] = []
                 tick_confirm[s] = {"count": 0, "dir": None}
                 symbol_confidence[s] = BASE_CONFIDENCE
+                pair_accuracy[s] = 0
 
             async with websockets.connect(DERIV_WS) as ws:
                 for s in symbols:
@@ -256,9 +279,7 @@ async def monitor():
 
                         print(f"[TICK] {pair} = {price}")
 
-                        if global_lock:
-                            continue
-                        if signals_this_hour >= MAX_SIGNALS_PER_HOUR:
+                        if global_lock or signals_this_hour >= MAX_SIGNALS_PER_HOUR:
                             continue
                         if pair in cooldowns and now < cooldowns[pair]:
                             continue
@@ -267,7 +288,7 @@ async def monitor():
                         if state != "NORMAL":
                             continue
 
-                        prob, direction = predict_probability(prices[pair])
+                        prob, direction = predict_probability(prices[pair], pair)
 
                         print(f"[READY] {pair} {direction} {prob:.2f}%")
 
@@ -281,7 +302,6 @@ async def monitor():
 
                         if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                             continue
-
                         if pair == last_pair_sent:
                             continue
 
@@ -304,27 +324,8 @@ async def monitor():
 
                         global_lock = True
                         cooldowns[pair] = expiry_time + timedelta(seconds=1)
-                        asyncio.create_task(unlock_after(expiry_time))
+                        asyncio.create_task(unlock_after(expiry_time, pair, entry, direction))
                         last_hour_signal = now
-
-                        if (datetime.now() - last_hour_signal).seconds > 3600 and not global_lock:
-                            top_pair = max(symbol_confidence, key=symbol_confidence.get)
-                            top_prices = prices[top_pair]
-                            if len(top_prices) < 10:
-                                continue
-                            prob, direction = predict_probability(top_prices)
-                            vol = np.std(top_prices[-20:])
-                            total_seconds = dynamic_expiry_seconds(vol)
-                            duration_min = total_seconds // 60
-                            duration_sec = total_seconds % 60
-                            expiry_time = datetime.now(TIMEZONE) + timedelta(seconds=total_seconds)
-
-                            send_final_signal(top_pair, direction, prob, duration_min, duration_sec, expiry_time)
-                            log_signal(top_pair, direction, top_prices[-1], prob, duration_min, duration_sec, expiry_time, vol, "NORMAL")
-
-                            global_lock = True
-                            asyncio.create_task(unlock_after(expiry_time))
-                            last_hour_signal = datetime.now(TIMEZONE)
 
                     except Exception as e:
                         print("[ERROR] Tick:", e)
