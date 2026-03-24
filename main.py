@@ -13,6 +13,7 @@ import pytz
 import csv
 import os
 from river import linear_model, preprocessing, metrics
+import random
 
 # -------------------
 # CONFIG
@@ -51,7 +52,6 @@ if not os.path.exists(TRADE_LOG):
 prices = {}
 tick_confirm = {}
 cooldowns = {}
-pending_signal = {}
 symbol_confidence = {}
 pair_accuracy = {}
 global_lock = False
@@ -108,12 +108,19 @@ def extract_features(p):
 def predict_probability(p, pair=None):
     features = extract_features(p)
     if not features:
-        return 0, None
-    prob = model.predict_proba_one(features).get(1, 0.5) * 100
+        return 50.0, "BUY"  # start neutral if not enough data
 
+    prob = model.predict_proba_one(features).get(1, None)
+    if prob is None:
+        # seed small random probability to start learning
+        prob = 0.5 + random.uniform(-0.05, 0.05)
+
+    prob *= 100
+
+    # adjust with historical pair accuracy
     if pair and pair in pair_accuracy:
         prob += pair_accuracy[pair] * 5
-        prob = min(prob, 99.9)
+        prob = min(max(prob, 1), 99.9)  # clamp between 1% and 99.9%
 
     direction = "BUY" if prob > 50 else "SELL"
     return prob, direction
@@ -187,6 +194,9 @@ def update_pair_accuracy(pair, entry, exit_price, direction):
 # -------------------
 
 def train_model(pair, entry, exit_price, direction):
+    if pair not in prices or len(prices[pair]) < 30:
+        return
+
     features = extract_features(prices[pair])
     if not features:
         return
