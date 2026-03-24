@@ -183,7 +183,7 @@ def update_pair_accuracy(pair, entry, exit_price, direction):
     return result
 
 # -------------------
-# ✅ FIX: MODEL LEARNING (ONLY ADDITION)
+# ✅ FIXED MODEL LEARNING
 # -------------------
 
 def train_model(pair, entry, direction):
@@ -194,12 +194,12 @@ def train_model(pair, entry, direction):
     if not features:
         return
 
-    future_price = prices[pair][-1]
+    exit_price = prices[pair][-1]
 
     if direction == "BUY":
-        label = 1 if future_price > entry else 0
+        label = 1 if exit_price > entry else 0
     else:
-        label = 1 if future_price < entry else 0
+        label = 1 if exit_price < entry else 0
 
     model.learn_one(features, label)
 
@@ -215,8 +215,6 @@ async def unlock_after(expiry_time, pair=None, entry=None, direction=None):
     if pair and entry is not None and direction is not None:
         exit_price = prices[pair][-1] if prices[pair] else entry
         update_pair_accuracy(pair, entry, exit_price, direction)
-
-        # ✅ FIX APPLIED HERE
         train_model(pair, entry, direction)
 
     global_lock = False
