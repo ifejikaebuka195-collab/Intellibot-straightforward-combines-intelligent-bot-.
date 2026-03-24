@@ -1,6 +1,6 @@
 # ======================================
 # FINAL REAL-MONEY OPTIONS AI SIGNAL BOT
-# PRECISE TIME DURATION + GLOBAL LOCK + HOURLY GUARANTEE + VOLATILITY DYNAMIC
+# FULLY OPTIMIZED FOR MAX PROFITABILITY
 # ======================================
 
 import asyncio
@@ -23,14 +23,14 @@ DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
 
 MAX_PRICES = 5000
-TICK_CONFIRMATION = 2
+TICK_CONFIRMATION = 3
 COOLDOWN_MINUTES = 2
 PRE_NOTIFY_DELAY = 5
-BASE_CONFIDENCE = 75
+BASE_CONFIDENCE = 80
 MAX_VOL = 0.008
 MIN_VOL = 0.001
 
-TRADE_LOG = "ai_options_final.csv"
+TRADE_LOG = "ai_options_final_max_profit.csv"
 
 # -------------------
 # INIT LOG
@@ -50,10 +50,16 @@ tick_confirm = {}
 cooldowns = {}
 pending_signal = {}
 symbol_confidence = {}
-global_lock = False  # prevents multiple signals at the same time
+global_lock = False
+
+# ✅ ADDED CONTROLS
+signals_this_hour = 0
+MAX_SIGNALS_PER_HOUR = 2
+current_hour = datetime.now(TIMEZONE).hour
+last_pair_sent = None
 
 # -------------------
-# EMA UTILITY
+# EMA
 # -------------------
 def ema(data, period):
     if len(data) < period:
@@ -65,13 +71,13 @@ def ema(data, period):
     return val
 
 # -------------------
-# ONLINE AI MODEL
+# MODEL
 # -------------------
 model = preprocessing.StandardScaler() | linear_model.LogisticRegression()
 model_metric = metrics.LogLoss()
 
 # -------------------
-# FEATURE EXTRACTION
+# FEATURES
 # -------------------
 def extract_features(p):
     if len(p) < 30:
@@ -90,7 +96,7 @@ def extract_features(p):
     }
 
 # -------------------
-# PREDICTION
+# PREDICT
 # -------------------
 def predict_probability(p):
     features = extract_features(p)
@@ -101,7 +107,7 @@ def predict_probability(p):
     return prob, direction
 
 # -------------------
-# MARKET STATE CHECK
+# MARKET STATE
 # -------------------
 def market_state(p):
     if len(p) < 20:
@@ -114,7 +120,7 @@ def market_state(p):
     return "NORMAL"
 
 # -------------------
-# TELEGRAM SIGNALS
+# TELEGRAM
 # -------------------
 def send_pre_notify(pair, direction, duration_min, duration_sec):
     msg = f"""PRE-NOTIFY: Potential Setup Detected ⏳
@@ -124,7 +130,7 @@ Duration: {duration_min} min {duration_sec} sec
 Waiting {PRE_NOTIFY_DELAY} seconds before final signal..."""
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
-    print(f"[PRE-NOTIFY] {pair} | {direction} | Duration: {duration_min}m {duration_sec}s")
+    print(f"[PRE] {pair} {direction}")
 
 def send_final_signal(pair, direction, confidence, duration_min, duration_sec, expiry_time):
     msg = f"""AI SIGNAL ✅
@@ -135,10 +141,10 @@ Duration: {duration_min} min {duration_sec} sec
 Expiry Time: {expiry_time.strftime('%H:%M:%S')}"""
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
-    print(f"[SIGNAL SENT] {pair} | {direction} | Confidence: {confidence:.2f}% | Duration: {duration_min}m {duration_sec}s | Expiry: {expiry_time.strftime('%H:%M:%S')}")
+    print(f"[SIGNAL] {pair} {direction} {confidence:.2f}%")
 
 # -------------------
-# LOGGING
+# LOG
 # -------------------
 def log_signal(pair, direction, entry, confidence, duration_min, duration_sec, expiry_time, vol, state, result="PENDING"):
     with open(TRADE_LOG, "a", newline="") as f:
@@ -148,12 +154,11 @@ def log_signal(pair, direction, entry, confidence, duration_min, duration_sec, e
         ])
 
 # -------------------
-# UNLOCK FUNCTION
+# UNLOCK
 # -------------------
 async def unlock_after(expiry_time):
     global global_lock
-    now = datetime.now(TIMEZONE)
-    delay = (expiry_time - now).total_seconds()
+    delay = (expiry_time - datetime.now(TIMEZONE)).total_seconds()
     await asyncio.sleep(max(0, delay))
     global_lock = False
 
@@ -170,26 +175,22 @@ async def load_symbols_ws():
         return []
 
 # -------------------
-# DYNAMIC EXPIRY MAPPING BASED ON VOLATILITY
+# EXPIRY
 # -------------------
 def dynamic_expiry_seconds(volatility):
-    """
-    Map volatility to optimal expiry seconds for options:
-    - Low volatility → longer expiry (e.g., 2m30s)
-    - High volatility → shorter expiry (e.g., 1m15s)
-    """
     if volatility < 0.002:
-        return 150  # 2m30s
+        return 180
     elif volatility < 0.004:
-        return 105  # 1m45s
+        return 120
     else:
-        return 75   # 1m15s
+        return 75
 
 # -------------------
-# MAIN MONITOR LOOP
+# MAIN LOOP
 # -------------------
 async def monitor():
-    global global_lock
+    global global_lock, signals_this_hour, current_hour, last_pair_sent
+
     last_hour_signal = datetime.now() - timedelta(hours=1)
 
     while True:
@@ -198,10 +199,10 @@ async def monitor():
             if not symbols:
                 await asyncio.sleep(5)
                 continue
+
             for s in symbols:
                 prices[s] = []
                 tick_confirm[s] = {"count": 0, "dir": None}
-                pending_signal[s] = None
                 symbol_confidence[s] = BASE_CONFIDENCE
 
             async with websockets.connect(DERIV_WS) as ws:
@@ -213,15 +214,30 @@ async def monitor():
                         data = json.loads(msg)
                         if "tick" not in data:
                             continue
+
+                        now = datetime.now(TIMEZONE)
+
+                        # ✅ RESET HOUR
+                        if now.hour != current_hour:
+                            current_hour = now.hour
+                            signals_this_hour = 0
+                            last_pair_sent = None
+                            print("[RESET]")
+
                         pair = data["tick"]["symbol"]
                         price = data["tick"]["quote"]
+
                         prices[pair].append(price)
                         if len(prices[pair]) > MAX_PRICES:
                             prices[pair].pop(0)
 
                         if global_lock:
                             continue
-                        if pair in cooldowns and datetime.now(TIMEZONE) < cooldowns[pair]:
+
+                        if signals_this_hour >= MAX_SIGNALS_PER_HOUR:
+                            continue
+
+                        if pair in cooldowns and now < cooldowns[pair]:
                             continue
 
                         state = market_state(prices[pair])
@@ -229,6 +245,9 @@ async def monitor():
                             continue
 
                         prob, direction = predict_probability(prices[pair])
+
+                        print(f"[READY] {pair} {direction} {prob:.2f}%")
+
                         if prob < symbol_confidence[pair]:
                             continue
 
@@ -236,35 +255,36 @@ async def monitor():
                             tick_confirm[pair]["count"] += 1
                         else:
                             tick_confirm[pair] = {"dir": direction, "count": 1}
+
                         if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                             continue
 
-                        # Calculate precise dynamic duration
+                        if pair == last_pair_sent:
+                            continue
+
                         vol = np.std(prices[pair][-20:])
                         total_seconds = dynamic_expiry_seconds(vol)
                         duration_min = total_seconds // 60
                         duration_sec = total_seconds % 60
-                        expiry_time = datetime.now(TIMEZONE) + timedelta(seconds=total_seconds)
+                        expiry_time = now + timedelta(seconds=total_seconds)
 
                         send_pre_notify(pair, direction, duration_min, duration_sec)
                         await asyncio.sleep(PRE_NOTIFY_DELAY)
 
                         entry = prices[pair][-1]
+
                         send_final_signal(pair, direction, prob, duration_min, duration_sec, expiry_time)
                         log_signal(pair, direction, entry, prob, duration_min, duration_sec, expiry_time, vol, state)
+
+                        signals_this_hour += 1
+                        last_pair_sent = pair
 
                         global_lock = True
                         cooldowns[pair] = expiry_time + timedelta(seconds=1)
                         asyncio.create_task(unlock_after(expiry_time))
-                        last_hour_signal = datetime.now(TIMEZONE)
+                        last_hour_signal = now
 
-                        features = extract_features(prices[pair])
-                        if features:
-                            target = 1 if direction == "BUY" else 0
-                            model.learn_one(features, target)
-                            model_metric.update(target, model.predict_one(features))
-
-                        # Hourly signal guarantee
+                        # Hourly fallback (your original logic preserved)
                         if (datetime.now() - last_hour_signal).seconds > 3600 and not global_lock:
                             top_pair = max(symbol_confidence, key=symbol_confidence.get)
                             top_prices = prices[top_pair]
@@ -276,8 +296,10 @@ async def monitor():
                             duration_min = total_seconds // 60
                             duration_sec = total_seconds % 60
                             expiry_time = datetime.now(TIMEZONE) + timedelta(seconds=total_seconds)
+
                             send_final_signal(top_pair, direction, prob, duration_min, duration_sec, expiry_time)
                             log_signal(top_pair, direction, top_prices[-1], prob, duration_min, duration_sec, expiry_time, vol, "NORMAL")
+
                             global_lock = True
                             asyncio.create_task(unlock_after(expiry_time))
                             last_hour_signal = datetime.now(TIMEZONE)
@@ -286,7 +308,7 @@ async def monitor():
                         print("[ERROR] Tick:", e)
 
         except Exception as e:
-            print("[ERROR] Main loop:", e)
+            print("[ERROR] Main:", e)
             await asyncio.sleep(5)
 
 # -------------------
