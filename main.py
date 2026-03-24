@@ -1,6 +1,6 @@
 # ======================================
-# DERIV AI SIGNAL BOT - FULLY ADAPTIVE
-# REAL MARKET + SELF-LEARNING + STABLE
+# DERIV AI SIGNAL BOT - DIALOGUE SYSTEM
+# FULLY ADAPTIVE + PRE-NOTIFY + LIVE MARKET
 # ======================================
 
 import asyncio
@@ -25,11 +25,12 @@ TIMEZONE = pytz.timezone("Africa/Lagos")
 MAX_PRICES = 5000
 TICK_CONFIRMATION = 2
 COOLDOWN_MINUTES = 2
+PRE_NOTIFY_DELAY = 10  # seconds before sending final signal
 
 prices = {}
 tick_confirm = {}
 cooldowns = {}
-pending = {}
+pending_signal = {}
 
 TRADE_LOG = "ai_trades.csv"
 
@@ -103,17 +104,31 @@ def market_state(p):
 # ================================
 # TELEGRAM SIGNALS
 # ================================
-def send_signal(pair, direction, prob):
+def send_pre_notify(pair, direction, duration):
     msg = f"""
-AI SIGNAL READY ✅
+PRE-NOTIFY: Perfect Setup Detected ⏳
+
+Asset: {pair}_otc
+Direction: {direction}
+Duration: {duration} min
+Waiting {PRE_NOTIFY_DELAY} seconds before final signal...
+"""
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                  data={"chat_id": CHAT_ID, "text": msg})
+    print(f"[PRE-NOTIFY] {pair} | {direction} | Duration: {duration} min")
+
+def send_final_signal(pair, direction, prob, duration):
+    msg = f"""
+AI SIGNAL ✅
 
 Asset: {pair}_otc
 Direction: {direction}
 Confidence: {prob:.2f}%
+Duration: {duration} min
 """
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
-    print(f"[SIGNAL READY] {pair} | {direction} | {prob:.2f}%")
+    print(f"[SIGNAL SENT] {pair} | {direction} | Confidence: {prob:.2f}% | Duration: {duration} min")
 
 # ================================
 # TRADE LOGGING
@@ -155,6 +170,7 @@ async def monitor():
             for s in symbols:
                 prices[s] = []
                 tick_confirm[s] = {"count": 0, "dir": None}
+                pending_signal[s] = None
 
             async with websockets.connect(DERIV_WS) as ws:
                 for s in symbols:
@@ -197,23 +213,28 @@ async def monitor():
                         if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                             continue
 
-                        entry = prices[pair][-1]
+                        # Calculate duration dynamically
+                        duration = max(1, min(5, int(np.std(prices[pair][-20:])*200)))
 
-                        # Send Telegram signal
-                        send_signal(pair, direction, prob)
+                        # Pre-notification
+                        send_pre_notify(pair, direction, duration)
+                        await asyncio.sleep(PRE_NOTIFY_DELAY)
+
+                        # Send final signal
+                        entry = prices[pair][-1]
+                        send_final_signal(pair, direction, prob, duration)
 
                         # Update cooldown
                         cooldowns[pair] = datetime.now(TIMEZONE) + timedelta(minutes=COOLDOWN_MINUTES)
 
                         # EXIT LOGIC: simulate waiting for duration
-                        await asyncio.sleep(60)
-
+                        await asyncio.sleep(duration * 60)
                         exit_price = prices[pair][-1]
 
                         # Log trade
                         log_trade(pair, direction, entry, exit_price)
 
-                        # Online learning: update the model
+                        # Online learning
                         features = extract_features(prices[pair])
                         if features:
                             target = 1 if exit_price > entry else 0
