@@ -53,10 +53,9 @@ tick_confirm = {}
 cooldowns = {}
 pending_signal = {}
 symbol_confidence = {}
-pair_accuracy = {}  # ✅ New: track each pair's historical success
+pair_accuracy = {}
 global_lock = False
 
-# ✅ ADDED CONTROLS
 signals_this_hour = 0
 MAX_SIGNALS_PER_HOUR = 2
 current_hour = datetime.now(TIMEZONE).hour
@@ -112,11 +111,10 @@ def predict_probability(p, pair=None):
         return 0, None
     prob = model.predict_proba_one(features).get(1, 0.5) * 100
 
-    # ✅ Adjust confidence dynamically by historical performance
     if pair and pair in pair_accuracy:
-        prob += pair_accuracy[pair] * 5  # boost high-performing pairs
-        prob = min(prob, 99.9)  # cap at 99.9%
-    
+        prob += pair_accuracy[pair] * 5
+        prob = min(prob, 99.9)
+
     direction = "BUY" if prob > 50 else "SELL"
     return prob, direction
 
@@ -171,19 +169,39 @@ def log_signal(pair, direction, entry, confidence, duration_min, duration_sec, e
         ])
 
 # -------------------
-# POST-SIGNAL PERFORMANCE UPDATE
+# PERFORMANCE UPDATE
 # -------------------
 
 def update_pair_accuracy(pair, entry, exit_price, direction):
-    # Simple calculation: +1 if correct, -1 if wrong
     if direction == "BUY":
         result = 1 if exit_price > entry else -1
     else:
         result = 1 if exit_price < entry else -1
     if pair not in pair_accuracy:
         pair_accuracy[pair] = 0
-    pair_accuracy[pair] = max(min(pair_accuracy[pair] + result, 5), -5)  # cap performance score
+    pair_accuracy[pair] = max(min(pair_accuracy[pair] + result, 5), -5)
     return result
+
+# -------------------
+# ✅ FIX: MODEL LEARNING (ONLY ADDITION)
+# -------------------
+
+def train_model(pair, entry, direction):
+    if pair not in prices or len(prices[pair]) < 30:
+        return
+
+    features = extract_features(prices[pair])
+    if not features:
+        return
+
+    future_price = prices[pair][-1]
+
+    if direction == "BUY":
+        label = 1 if future_price > entry else 0
+    else:
+        label = 1 if future_price < entry else 0
+
+    model.learn_one(features, label)
 
 # -------------------
 # UNLOCK
@@ -193,10 +211,14 @@ async def unlock_after(expiry_time, pair=None, entry=None, direction=None):
     global global_lock
     delay = (expiry_time - datetime.now(TIMEZONE)).total_seconds()
     await asyncio.sleep(max(0, delay))
-    # ✅ Update pair performance on expiry
+
     if pair and entry is not None and direction is not None:
         exit_price = prices[pair][-1] if prices[pair] else entry
         update_pair_accuracy(pair, entry, exit_price, direction)
+
+        # ✅ FIX APPLIED HERE
+        train_model(pair, entry, direction)
+
     global_lock = False
 
 # -------------------
