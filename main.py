@@ -182,6 +182,7 @@ async def load_symbols_ws():
         async with websockets.connect(DERIV_WS) as ws:
             await ws.send(json.dumps({"active_symbols": "brief"}))
             res = json.loads(await ws.recv())
+            # Only FRX pairs; arrow pairs removed
             return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx")]
     except:
         return []
@@ -208,7 +209,7 @@ async def monitor():
     last_hour_signal = datetime.now() - timedelta(hours=1)
 
     # ✅ Add 7 popular crypto pairs for tick streaming
-    crypto_pairs = ["R_100", "R_25", "R_50", "R_75", "R_10", "R_20", "R_5"]
+    crypto_pairs = ["BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD", "BCHUSD", "ADAUSD", "DOGEUSD"]
 
     while True:
         try:
@@ -252,7 +253,7 @@ async def monitor():
                             prices[pair].pop(0)
 
                         # -------------------
-                        # ✅ NEW: Print ticks to deploy page
+                        # ✅ Print ticks on deploy page
                         print(f"[TICK] {pair} = {price}")
 
                         if global_lock:
@@ -306,7 +307,7 @@ async def monitor():
                         asyncio.create_task(unlock_after(expiry_time))
                         last_hour_signal = now
 
-                        # Hourly fallback (your original logic preserved)
+                        # Hourly fallback (original logic preserved)
                         if (datetime.now() - last_hour_signal).seconds > 3600 and not global_lock:
                             top_pair = max(symbol_confidence, key=symbol_confidence.get)
                             top_prices = prices[top_pair]
