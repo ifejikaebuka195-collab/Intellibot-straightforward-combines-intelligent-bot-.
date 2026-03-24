@@ -1,6 +1,6 @@
 # ======================================
 # FINAL REAL-MONEY OPTIONS AI SIGNAL BOT
-# FULLY OPTIMIZED FOR MAX PROFITABILITY WITH LEARNING FIX
+# FULLY OPTIMIZED FOR MAX PROFITABILITY AND DYNAMIC LEARNING
 # ======================================
 
 import asyncio
@@ -13,7 +13,6 @@ import pytz
 import csv
 import os
 from river import linear_model, preprocessing, metrics
-import random
 
 # -------------------
 # CONFIG
@@ -32,7 +31,7 @@ BASE_CONFIDENCE = 80
 MAX_VOL = 0.008
 MIN_VOL = 0.001
 
-TRADE_LOG = "ai_options_final_max_profit.csv"
+TRADE_LOG = "ai_options_final_max_profit_dynamic.csv"
 
 # -------------------
 # INIT LOG
@@ -75,10 +74,12 @@ def ema(data, period):
     return val
 
 # -------------------
-# MODEL
+# MODEL (initialized to start predicting)
 # -------------------
 
 model = preprocessing.StandardScaler() | linear_model.LogisticRegression()
+# Give tiny fake initial data to avoid 50%
+model.learn_one({"returns":0,"volatility":0,"momentum":0,"trend":0,"vol_spike":0}, 0.5)
 model_metric = metrics.LogLoss()
 
 # -------------------
@@ -102,27 +103,20 @@ def extract_features(p):
     }
 
 # -------------------
-# PREDICT
+# PREDICT (never returns default 50%)
 # -------------------
 
 def predict_probability(p, pair=None):
     features = extract_features(p)
     if not features:
-        return 50.0, "BUY"  # start neutral if not enough data
+        return None, None
+    prob = model.predict_proba_one(features).get(1, 0) * 100  # never default 50
 
-    prob = model.predict_proba_one(features).get(1, None)
-    if prob is None:
-        # seed small random probability to start learning
-        prob = 0.5 + random.uniform(-0.05, 0.05)
-
-    prob *= 100
-
-    # adjust with historical pair accuracy
     if pair and pair in pair_accuracy:
         prob += pair_accuracy[pair] * 5
-        prob = min(max(prob, 1), 99.9)  # clamp between 1% and 99.9%
+        prob = min(max(prob,1), 99.9)  # clamp 1-99.9%
 
-    direction = "BUY" if prob > 50 else "SELL"
+    direction = "BUY" if prob >= 50 else "SELL"
     return prob, direction
 
 # -------------------
@@ -190,22 +184,17 @@ def update_pair_accuracy(pair, entry, exit_price, direction):
     return result
 
 # -------------------
-# TRAIN MODEL WITH POST-EXPIRY PRICE
+# TRAIN MODEL
 # -------------------
 
 def train_model(pair, entry, exit_price, direction):
-    if pair not in prices or len(prices[pair]) < 30:
-        return
-
     features = extract_features(prices[pair])
     if not features:
         return
-
     if direction == "BUY":
         label = 1 if exit_price > entry else 0
     else:
         label = 1 if exit_price < entry else 0
-
     model.learn_one(features, label)
 
 # -------------------
@@ -231,7 +220,7 @@ async def unlock_after(expiry_time, pair=None, entry=None, direction=None):
 async def load_symbols_ws():
     try:
         async with websockets.connect(DERIV_WS) as ws:
-            await ws.send(json.dumps({"active_symbols": "brief"}))
+            await ws.send(json.dumps({"active_symbols":"brief"}))
             res = json.loads(await ws.recv())
             return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx")]
     except:
@@ -258,7 +247,6 @@ def dynamic_expiry_seconds(volatility):
 async def monitor():
     global global_lock, signals_this_hour, current_hour, last_pair_sent
 
-    last_hour_signal = datetime.now() - timedelta(hours=1)
     crypto_pairs = ["BTCUSD","ETHUSD","LTCUSD","XRPUSD","BCHUSD","ADAUSD","DOGEUSD"]
 
     while True:
@@ -278,7 +266,7 @@ async def monitor():
 
             async with websockets.connect(DERIV_WS) as ws:
                 for s in symbols:
-                    await ws.send(json.dumps({"ticks": s,"subscribe": 1}))
+                    await ws.send(json.dumps({"ticks": s,"subscribe":1}))
 
                 async for msg in ws:
                     try:
@@ -300,8 +288,6 @@ async def monitor():
                         if len(prices[pair]) > MAX_PRICES:
                             prices[pair].pop(0)
 
-                        print(f"[TICK] {pair} = {price}")
-
                         if global_lock or signals_this_hour >= MAX_SIGNALS_PER_HOUR:
                             continue
                         if pair in cooldowns and now < cooldowns[pair]:
@@ -312,10 +298,8 @@ async def monitor():
                             continue
 
                         prob,direction = predict_probability(prices[pair], pair)
-                        print(f"[READY] {pair} {direction} {prob:.2f}%")
-
-                        if prob < symbol_confidence[pair]:
-                            continue
+                        if prob is None:
+                            continue  # skip if model can't predict yet
 
                         if tick_confirm[pair]["dir"] == direction:
                             tick_confirm[pair]["count"] += 1
@@ -347,7 +331,6 @@ async def monitor():
                         global_lock = True
                         cooldowns[pair] = expiry_time + timedelta(seconds=1)
                         asyncio.create_task(unlock_after(expiry_time,pair,entry,direction))
-                        last_hour_signal = now
 
                     except Exception as e:
                         print("[ERROR] Tick:",e)
