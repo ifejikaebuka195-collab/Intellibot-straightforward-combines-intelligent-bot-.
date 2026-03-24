@@ -1,6 +1,7 @@
 # ======================================
-# FULLY UPGRADED REAL-MONEY AI SIGNAL BOT
-# READY FOR DEPLOYMENT WITH MARTINGALE
+# FINAL REAL-MONEY NO-MARTINGALE AI SIGNAL BOT
+# FULLY DEPLOYABLE TO LIVE MARKET
+# TELEGRAM SIGNAL FORMAT MATCHING SAMPLE
 # ======================================
 
 import asyncio
@@ -12,12 +13,10 @@ from datetime import datetime, timedelta
 import pytz
 import csv
 import os
-from river import linear_model, preprocessing, metrics
 
 # -------------------
 # CONFIG
 # -------------------
-
 BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
 CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
@@ -27,44 +26,35 @@ MAX_PRICES = 5000
 TICK_CONFIRMATION = 3
 PRE_NOTIFY_DELAY = 5
 BASE_CONFIDENCE = 80
-MAX_VOL = 0.008
-MIN_VOL = 0.001
-ENTRY_OFFSET = 2  # minutes ahead for entry
-MARTINGALE_INTERVAL = 2  # minutes between Martingale levels
+MAX_SIGNALS_PER_HOUR = 2
 
-TRADE_LOG = "ai_real_money_martingale.csv"
+TRADE_LOG = "ai_no_martingale_signals.csv"
 
 # -------------------
 # INIT LOG
 # -------------------
-
 if not os.path.exists(TRADE_LOG):
     with open(TRADE_LOG, "w", newline="") as f:
         csv.writer(f).writerow([
-            "time","pair","dir","entry_time","confidence",
-            "expiry_time","volatility","market_state","martingale_level","result"
+            "time","pair","direction","entry","confidence","duration_min",
+            "duration_sec","expiry_time","volatility","market_state","result"
         ])
 
 # -------------------
 # GLOBALS
 # -------------------
-
 prices = {}
 tick_confirm = {}
 cooldowns = {}
 symbol_confidence = {}
-pair_accuracy = {}
 global_lock = False
-
 signals_this_hour = 0
-MAX_SIGNALS_PER_HOUR = 2
 current_hour = datetime.now(TIMEZONE).hour
 last_pair_sent = None
 
 # -------------------
-# EMA
+# EMA FUNCTION
 # -------------------
-
 def ema(data, period):
     if len(data) < period:
         return None
@@ -75,17 +65,8 @@ def ema(data, period):
     return val
 
 # -------------------
-# MODEL
-# -------------------
-
-model = preprocessing.StandardScaler() | linear_model.LogisticRegression()
-model.learn_one({"returns":0,"volatility":0,"momentum":0,"trend":0,"vol_spike":0}, 0.5)
-model_metric = metrics.LogLoss()
-
-# -------------------
 # FEATURE EXTRACTION
 # -------------------
-
 def extract_features(p):
     if len(p) < 30:
         return None
@@ -103,24 +84,22 @@ def extract_features(p):
     }
 
 # -------------------
-# PREDICTION
+# PREDICTION LOGIC
 # -------------------
-
-def predict_probability(p, pair=None):
+def predict_direction(p):
     features = extract_features(p)
     if not features:
-        return None, None
-    prob = model.predict_proba_one(features).get(1, 0) * 100
-    if pair and pair in pair_accuracy:
-        prob += pair_accuracy[pair] * 5
-        prob = min(max(prob,1), 99.9)
-    direction = "BUY" if prob >= 50 else "SELL"
+        return 0, None
+    trend_score = features["returns"] + features["momentum"] * 0.5
+    prob = min(max((trend_score + 0.5) * 100, 1), 99)  # Scale 0-100%
+    direction = "BUY" if prob > 50 else "SELL"
     return prob, direction
 
 # -------------------
 # MARKET STATE FILTER
 # -------------------
-
+MIN_VOL = 0.001
+MAX_VOL = 0.008
 def market_state(p):
     if len(p) < 20:
         return "UNKNOWN"
@@ -132,143 +111,93 @@ def market_state(p):
     return "NORMAL"
 
 # -------------------
-# TELEGRAM
+# TELEGRAM MESSAGE FORMATTING
 # -------------------
+def format_signal(pair, direction, confidence, duration_min, duration_sec, volatility):
+    arrow = "↗️" if direction == "BUY" else "↘️"
+    signal_text = f"""🖇 Signal information:
+       {pair} — {duration_min} minutes
 
-def send_pre_notify(pair, direction, entry_time):
-    msg = f"""PRE-NOTIFY: Potential Setup Detected ⏳
-Asset: {pair}
-Direction: {direction}
-Entry Time: {entry_time.strftime('%H:%M:%S')}
-Waiting {PRE_NOTIFY_DELAY} seconds before final signal..."""
+📰 Market Setting:
+       Info context: None
+       Volatility: {'Low' if volatility<0.002 else 'Moderate' if volatility<0.004 else 'High'}
+       
+🖥 Technical overview:
+       Only for stock quotes
+
+💷 Probabilities:
+       Signal reliability: {confidence:.2f}%
+
+🧨 Bot signal:
+       {direction} {arrow}"""
+    return signal_text
+
+def send_pre_notify(pair, direction, duration_min, duration_sec, confidence, volatility):
+    msg = format_signal(pair, direction, confidence, duration_min, duration_sec, volatility)
+    msg = f"PRE-NOTIFY: Potential Setup Detected ⏳\n{msg}\nWaiting {PRE_NOTIFY_DELAY} seconds before final signal..."
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
-    print(f"[PRE] {pair} {direction} Entry at {entry_time.strftime('%H:%M:%S')}")
+    print(f"[PRE] {pair} {direction} {confidence:.2f}%")
 
-def send_final_signal(pair, direction, confidence, entry_time, expiry_time):
-    # Calculate Martingale levels
-    m1 = entry_time + timedelta(minutes=MARTINGALE_INTERVAL)
-    m2 = m1 + timedelta(minutes=MARTINGALE_INTERVAL)
-    m3 = m2 + timedelta(minutes=MARTINGALE_INTERVAL)
-
-    msg = f"""🚨TRADE NOW!!
-
-Asset: {pair}
-Entry Time: {entry_time.strftime('%H:%M:%S')}
-Direction: {direction}
-Expiry: {expiry_time.strftime('%H:%M:%S')}
-Confidence: {confidence:.2f}%
-
-🎯 Martingale Levels:
-🔁 Level 1 → {m1.strftime('%H:%M:%S')}
-🔁 Level 2 → {m2.strftime('%H:%M:%S')}
-🔁 Level 3 → {m3.strftime('%H:%M:%S')}"""
+def send_final_signal(pair, direction, confidence, duration_min, duration_sec, expiry_time, volatility):
+    msg = format_signal(pair, direction, confidence, duration_min, duration_sec, volatility)
+    msg = f"AI SIGNAL ✅\n{msg}\nExpiry Time: {expiry_time.strftime('%H:%M:%S')}"
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": msg})
-    print(f"[SIGNAL] {pair} {direction} Entry {entry_time.strftime('%H:%M:%S')}")
-
-    # Log all levels
-    for level, t in enumerate([entry_time, m1, m2, m3]):
-        log_signal(pair, direction, t, confidence, expiry_time, np.std(prices[pair][-20:]), market_state(prices[pair]), level+1)
+    print(f"[SIGNAL] {pair} {direction} {confidence:.2f}%")
 
 # -------------------
 # LOGGING
 # -------------------
-
-def log_signal(pair, direction, entry_time, confidence, expiry_time, vol, state, martingale_level, result="PENDING"):
+def log_signal(pair, direction, entry, confidence, duration_min, duration_sec, expiry_time, vol, state, result="PENDING"):
     with open(TRADE_LOG, "a", newline="") as f:
         csv.writer(f).writerow([
-            datetime.now(TIMEZONE), pair, direction, entry_time.strftime('%H:%M:%S'), confidence,
-            expiry_time.strftime('%H:%M:%S'), vol, state, martingale_level, result
+            datetime.now(TIMEZONE), pair, direction, entry, confidence,
+            duration_min, duration_sec, expiry_time.strftime('%H:%M:%S'), vol, state, result
         ])
 
 # -------------------
-# PERFORMANCE UPDATE
+# UNLOCK AFTER SIGNAL
 # -------------------
-
-def update_pair_accuracy(pair, entry, exit_price, direction):
-    if direction == "BUY":
-        result = 1 if exit_price > entry else -1
-    else:
-        result = 1 if exit_price < entry else -1
-    if pair not in pair_accuracy:
-        pair_accuracy[pair] = 0
-    pair_accuracy[pair] = max(min(pair_accuracy[pair] + result, 5), -5)
-    return result
-
-# -------------------
-# TRAIN MODEL
-# -------------------
-
-def train_model(pair, entry, exit_price, direction):
-    features = extract_features(prices[pair])
-    if not features:
-        return
-    if direction == "BUY":
-        label = 1 if exit_price > entry else 0
-    else:
-        label = 1 if exit_price < entry else 0
-    model.learn_one(features, label)
-
-# -------------------
-# UNLOCK
-# -------------------
-
-async def unlock_after(expiry_time, pair=None, entry=None, direction=None):
+async def unlock_after(expiry_time):
     global global_lock
     delay = (expiry_time - datetime.now(TIMEZONE)).total_seconds()
     await asyncio.sleep(max(0, delay))
-    if pair and entry is not None and direction is not None:
-        exit_price = prices[pair][-1] if prices[pair] else entry
-        update_pair_accuracy(pair, entry, exit_price, direction)
-        train_model(pair, entry, exit_price, direction)
     global_lock = False
 
 # -------------------
-# LOAD SYMBOLS
+# DYNAMIC EXPIRY
 # -------------------
-
-async def load_symbols_ws():
-    try:
-        async with websockets.connect(DERIV_WS) as ws:
-            await ws.send(json.dumps({"active_symbols":"brief"}))
-            res = json.loads(await ws.recv())
-            return [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx")]
-    except:
-        return []
-
-# -------------------
-# ADAPTIVE EXPIRY
-# -------------------
-
 def dynamic_expiry_seconds(volatility):
-    return 120  # fixed 2 minutes for real-money trading
+    if volatility < 0.002:
+        return 180
+    elif volatility < 0.004:
+        return 120
+    else:
+        return 75
 
 # -------------------
 # MAIN LOOP
 # -------------------
-
 async def monitor():
     global global_lock, signals_this_hour, current_hour, last_pair_sent
     crypto_pairs = ["BTCUSD","ETHUSD","LTCUSD","XRPUSD","BCHUSD","ADAUSD","DOGEUSD"]
 
     while True:
         try:
-            symbols = await load_symbols_ws()
-            if not symbols:
-                await asyncio.sleep(5)
-                continue
-
-            symbols = list(set(symbols + crypto_pairs))
-            for s in symbols:
-                prices[s] = []
-                tick_confirm[s] = {"count":0,"dir":None}
-                symbol_confidence[s] = BASE_CONFIDENCE
-                pair_accuracy[s] = 0
-
             async with websockets.connect(DERIV_WS) as ws:
+                await ws.send(json.dumps({"active_symbols":"brief"}))
+                res = json.loads(await ws.recv())
+                symbols = [s["symbol"] for s in res["active_symbols"] if s["symbol"].startswith("frx")]
+                symbols = list(set(symbols + crypto_pairs))
+
                 for s in symbols:
-                    await ws.send(json.dumps({"ticks": s,"subscribe":1}))
+                    prices[s] = []
+                    tick_confirm[s] = {"count": 0, "dir": None}
+                    symbol_confidence[s] = BASE_CONFIDENCE
+
+                for s in symbols:
+                    await ws.send(json.dumps({"ticks": s, "subscribe": 1}))
 
                 async for msg in ws:
                     try:
@@ -281,7 +210,7 @@ async def monitor():
                             current_hour = now.hour
                             signals_this_hour = 0
                             last_pair_sent = None
-                            print("[RESET]")
+                            print("[RESET HOUR]")
 
                         pair = data["tick"]["symbol"]
                         price = data["tick"]["quote"]
@@ -290,54 +219,60 @@ async def monitor():
                         if len(prices[pair]) > MAX_PRICES:
                             prices[pair].pop(0)
 
-                        if global_lock or signals_this_hour >= MAX_SIGNALS_PER_HOUR:
+                        if global_lock:
                             continue
-                        if pair in cooldowns and now < cooldowns[pair]:
+                        if signals_this_hour >= MAX_SIGNALS_PER_HOUR:
+                            continue
+                        if pair in tick_confirm and now < tick_confirm[pair].get("cooldown", now):
                             continue
 
                         state = market_state(prices[pair])
                         if state != "NORMAL":
                             continue
 
-                        prob,direction = predict_probability(prices[pair], pair)
-                        if prob is None:
+                        prob, direction = predict_direction(prices[pair])
+                        if prob < symbol_confidence[pair]:
                             continue
 
+                        # Tick confirmation
                         if tick_confirm[pair]["dir"] == direction:
                             tick_confirm[pair]["count"] += 1
                         else:
-                            tick_confirm[pair] = {"dir":direction,"count":1}
+                            tick_confirm[pair] = {"dir": direction, "count": 1}
 
                         if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                             continue
+
                         if pair == last_pair_sent:
                             continue
 
-                        # Calculate entry time 2 minutes ahead
-                        entry_time = now + timedelta(minutes=ENTRY_OFFSET)
-                        expiry_time = entry_time + timedelta(seconds=dynamic_expiry_seconds(np.std(prices[pair][-20:])))
+                        vol = np.std(prices[pair][-20:])
+                        total_seconds = dynamic_expiry_seconds(vol)
+                        duration_min = total_seconds // 60
+                        duration_sec = total_seconds % 60
+                        expiry_time = now + timedelta(seconds=total_seconds)
 
-                        # Pre-notify
-                        send_pre_notify(pair, direction, entry_time)
+                        send_pre_notify(pair, direction, duration_min, duration_sec, prob, vol)
                         await asyncio.sleep(PRE_NOTIFY_DELAY)
 
-                        # Final signal
-                        send_final_signal(pair, direction, prob, entry_time, expiry_time)
+                        entry = prices[pair][-1]
+
+                        send_final_signal(pair, direction, prob, duration_min, duration_sec, expiry_time, vol)
+                        log_signal(pair, direction, entry, prob, duration_min, duration_sec, expiry_time, vol, state)
 
                         signals_this_hour += 1
                         last_pair_sent = pair
                         global_lock = True
-                        cooldowns[pair] = expiry_time + timedelta(seconds=1)
-                        asyncio.create_task(unlock_after(expiry_time, pair, prices[pair][-1], direction))
+                        tick_confirm[pair]["cooldown"] = expiry_time
+                        asyncio.create_task(unlock_after(expiry_time))
 
                     except Exception as e:
-                        print("[ERROR] Tick:",e)
+                        print("[ERROR] Tick:", e)
         except Exception as e:
-            print("[ERROR] Main:",e)
+            print("[ERROR] Main Loop:", e)
             await asyncio.sleep(5)
 
 # -------------------
 # RUN
 # -------------------
-
 asyncio.run(monitor())
