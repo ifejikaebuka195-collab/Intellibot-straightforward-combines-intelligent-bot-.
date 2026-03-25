@@ -66,50 +66,62 @@ def ema(data, period):
 # FEATURE EXTRACTION
 # -------------------
 def extract_features(p):
-    if len(p) < 30:
+    if len(p) < 50:
         return None
+
     returns = (p[-1] - p[-2]) / p[-2]
     volatility = np.std(p[-20:])
     momentum = np.sum(np.diff(p[-10:]))
-    trend_strength = abs(ema(p[-20:],5) - ema(p[-50:],13) if len(p) >= 50 else 0)
+
+    fast_ema = ema(p[-20:], 5)
+    slow_ema = ema(p[-50:], 13)
+
+    trend_strength = abs(fast_ema - slow_ema) if fast_ema and slow_ema else 0
     vol_spike = (p[-1] - np.mean(p[-10:])) / (np.std(p[-10:]) + 1e-9)
+
     return {
         "returns": returns,
         "volatility": volatility,
         "momentum": momentum,
         "trend": trend_strength,
-        "vol_spike": vol_spike
+        "vol_spike": vol_spike,
+        "fast": fast_ema,
+        "slow": slow_ema
     }
 
 # -------------------
-# PREDICTION LOGIC
+# ADAPTIVE MARKET LOGIC (NEW)
 # -------------------
-def predict_direction(p):
-    features = extract_features(p)
-    if not features:
+def adaptive_decision(p):
+    f = extract_features(p)
+    if not f:
         return 0, None
-    trend_score = features["returns"] + features["momentum"] * 0.5
-    prob = min(max((trend_score + 0.5) * 100, 1), 99)
-    direction = "BUY" if prob > 50 else "SELL"
-    return prob, direction
+
+    # Detect market type
+    if f["trend"] > 0.0005:
+        market_type = "TREND"
+    elif abs(f["momentum"]) < 0.0001:
+        market_type = "RANGE"
+    else:
+        market_type = "WEAK"
+
+    # Strong spike detection
+    if abs(f["vol_spike"]) > 2:
+        direction = "BUY" if f["returns"] > 0 else "SELL"
+        return 95, direction
+
+    # Trend trading
+    if market_type == "TREND":
+        if f["fast"] > f["slow"]:
+            return 90, "BUY"
+        else:
+            return 90, "SELL"
+
+    # Range = skip (no bad trades)
+    return 0, None
 
 # -------------------
-# MARKET STATE FILTER
-# -------------------
-MIN_VOL = 0.001
-MAX_VOL = 0.008
-def market_state(p):
-    if len(p) < 20:
-        return "UNKNOWN"
-    vol = np.std(p[-20:])
-    if vol < MIN_VOL:
-        return "LOW_VOL"
-    elif vol > MAX_VOL:
-        return "HIGH_VOL"
-    return "NORMAL"
-
-# -------------------
-# TELEGRAM MESSAGE FORMATTING
+# TELEGRAM MESSAGE
 # -------------------
 def format_signal(pair, direction, confidence, duration_min, duration_sec, volatility):
     arrow = "↗️" if direction == "BUY" else "↘️"
@@ -117,11 +129,7 @@ def format_signal(pair, direction, confidence, duration_min, duration_sec, volat
 {pair} — {duration_min} minutes
 
 📰 Market Setting:
-Info context: None
 Volatility: {'Moderate' if volatility<0.004 else 'High'}
-
-🖥 Technical overview:
-Only for stock quotes
 
 💷 Probabilities:
 Signal reliability: {confidence:.2f}%
@@ -155,6 +163,7 @@ async def unlock_after(expiry_time):
     delay = (expiry_time - datetime.now(TIMEZONE)).total_seconds()
     await asyncio.sleep(max(0, delay))
     global_lock = False
+    print("[UNLOCKED] Ready for next signal")
 
 # -------------------
 # MAIN LOOP
@@ -185,40 +194,28 @@ async def monitor():
                         if "tick" not in data:
                             continue
 
-                        now = datetime.now(TIMEZONE)
-                        if now.hour != current_hour:
-                            current_hour = now.hour
-                            signals_this_hour = 0
-                            last_pair_sent = None
-                            print("[RESET HOUR]")
-
                         pair = data["tick"]["symbol"]
                         price = data["tick"]["quote"]
 
-                        # DEBUG: Show all ticks
-                        print(f"[TICK] {pair} = {price}")
+                        print(f"[TICK] {pair}: {price}")
 
                         prices[pair].append(price)
                         if len(prices[pair]) > MAX_PRICES:
                             prices[pair].pop(0)
 
+                        now = datetime.now(TIMEZONE)
+
                         if global_lock:
-                            continue
-                        if signals_this_hour >= MAX_SIGNALS_PER_HOUR:
-                            continue
-                        if pair in tick_confirm and now < tick_confirm[pair].get("cooldown", now):
                             continue
 
                         vol = np.std(prices[pair][-20:])
-                        # Only allow medium or high volatility
                         if vol < 0.002:
                             continue
 
-                        prob, direction = predict_direction(prices[pair])
-                        if prob < symbol_confidence[pair]:
+                        prob, direction = adaptive_decision(prices[pair])
+                        if not direction or prob < 85:
                             continue
 
-                        # Tick confirmation
                         if tick_confirm[pair]["dir"] == direction:
                             tick_confirm[pair]["count"] += 1
                         else:
@@ -227,28 +224,22 @@ async def monitor():
                         if tick_confirm[pair]["count"] < TICK_CONFIRMATION:
                             continue
 
-                        if pair == last_pair_sent:
-                            continue
+                        print(f"[SIGNAL READY] {pair} {direction} {prob:.2f}%")
 
-                        # Enforce strict 2-minute duration
                         duration_min = 2
                         duration_sec = 0
                         expiry_time = now + timedelta(minutes=2)
 
-                        # DEBUG: Signal about to trigger
-                        print(f"[READY SIGNAL] {pair} {direction} prob={prob:.2f}% vol={vol:.5f}")
-
                         send_final_signal(pair, direction, prob, duration_min, duration_sec, expiry_time, vol)
-                        log_signal(pair, direction, prob, duration_min, duration_sec, expiry_time, vol, "NORMAL")
+                        log_signal(pair, direction, prob, duration_min, duration_sec, expiry_time, vol, "ADAPTIVE")
 
-                        signals_this_hour += 1
-                        last_pair_sent = pair
                         global_lock = True
                         tick_confirm[pair]["cooldown"] = expiry_time
                         asyncio.create_task(unlock_after(expiry_time))
 
                     except Exception as e:
                         print("[ERROR] Tick:", e)
+
         except Exception as e:
             print("[ERROR] Main Loop:", e)
             await asyncio.sleep(5)
