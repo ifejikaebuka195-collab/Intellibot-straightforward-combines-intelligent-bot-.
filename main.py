@@ -3,6 +3,7 @@
 # Fully upgraded with weekly self-updates
 # Martingale 1-3, trend, volatility, spike/pullback, supply/demand, BoS/FVG
 # Adaptive TP/SL, signal cooldown, weekly AI update
+# Scans all symbols in a row for signals
 # ======================================
 
 import os
@@ -20,7 +21,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # -------------------
 # CONFIG
 # -------------------
-BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"  # Replace with your BotFather token
+BOT_TOKEN = "8640045107:AAEBfp3L8go-qAVkKdrb2LPz4LrzhqblbNw"
 CHAT_ID = "6918721957"
 DERIV_WS = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 TIMEZONE = pytz.timezone("Africa/Lagos")
@@ -53,7 +54,6 @@ async def fetch_symbols(ws):
         data = json.loads(msg)
         if "active_symbols" in data:
             symbols = [s["symbol"] for s in data["active_symbols"]]
-            # OTC + Top Crypto
             otc = [s for s in symbols if s.startswith("OTC")]
             crypto = ["CRYPTO:BTCUSD","CRYPTO:ETHUSD","CRYPTO:XRPUSD","CRYPTO:LTCUSD","CRYPTO:BCHUSD","CRYPTO:ADAUSD","CRYPTO:DOGEUSD"]
             return otc + crypto
@@ -156,12 +156,13 @@ def save_trade(symbol, direction, tp, sl, timeframe, martingale_level):
         ])
 
 # -------------------
-# SIGNAL LOOP
+# SIGNAL LOOP - SCAN ALL SYMBOLS IN A ROW
 # -------------------
 async def signal_loop():
     while True:
         await asyncio.sleep(5)
-        for sym in market_data.keys():
+        symbols = list(market_data.keys())
+        for sym in symbols:  # scanning all symbols in a row
             if not is_volatile(sym): continue
             direction = detect_trend(sym)
             spike = detect_spike_pullback(sym)
@@ -174,12 +175,8 @@ async def signal_loop():
 # -------------------
 async def weekly_ai_update():
     while True:
-        await asyncio.sleep(7*24*3600)  # Every week
-        # Example: fetch market-adjusted parameters from online source
-        # Here you could add neural net retraining or algorithm adjustment
-        # Placeholder is not used, we assume your strategy improves via market data
+        await asyncio.sleep(7*24*3600)
         print("Weekly AI Update: Adjusting to new market conditions...")
-        # Could include volatility thresholds, TP/SL recalibration, trend logic refinement
 
 # -------------------
 # TELEGRAM BOT START
